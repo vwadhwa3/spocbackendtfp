@@ -1,2 +1,10 @@
 node_modules/
 .env
+
+# Logs and runtime output
+*.log
+*.err
+uploads/
+
+# OS
+.DS_Store

@@ -4,7 +4,7 @@ const {
   getEnumMasterByIdService,
   updateEnumMasterService,
   deleteEnumMasterService,
-} = require("../../services/Admin/enumMaster.service.js");
+} = require("../../services/Admin/enumMaster.service");
 
 // Create Enum Master Controller
 const createEnumMasterController = async (req, res) => {

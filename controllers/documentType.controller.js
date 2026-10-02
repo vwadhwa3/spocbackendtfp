@@ -1,7 +1,7 @@
 const {
   getAllDocumentTypesService,
   createDocumentTypeService,
-} = require("../services/documentType.service.js");
+} = require("../services/documentType.service");
 
 const getAllDocumentTypesController = async (req, res) => {
   try {

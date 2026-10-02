@@ -4,7 +4,7 @@ const router = express.Router();
 const {
   getAllDocumentTypesController,
   createDocumentTypeController,
-} = require("../controllers/documentType.controller.js");
+} = require("../controllers/documentType.controller");
 
 router.get("/view", getAllDocumentTypesController);
 

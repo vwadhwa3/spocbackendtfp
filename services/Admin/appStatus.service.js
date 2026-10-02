@@ -1,4 +1,4 @@
-const { getPool } = require("../../config/dataBase.js");
+const { getPool } = require("../../config/database");
 
 // Create Application Status
 const createAppStatusService = async (body) => {

@@ -4,7 +4,7 @@ const {
   getMaritalStatusByIdService,
   updateMaritalStatusService,
   deleteMaritalStatusService,
-} = require("../../services/Admin/maritialStatues.service");
+} = require("../../services/Admin/maritalStatus.service");
 
 // Create Marital Status
 const createMaritalStatusController = async (req, res) => {

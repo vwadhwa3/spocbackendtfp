@@ -1,4 +1,4 @@
-const { getPool } = require("../config/dataBase");
+const { getPool } = require("../config/database");
 
 const getAllDocumentCategoriesService = async () => {
   const pool = getPool();

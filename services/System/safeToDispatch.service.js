@@ -1,5 +1,5 @@
-const { getPool } = require("../../config/dataBase.js");
-const { sendEmailWithAttachments } = require("../../utils/email.util.js");
+const { getPool } = require("../../config/database");
+const { sendEmailWithAttachments } = require("../../utils/email.util");
 
 const CUSTOMER_LEAD_APPROVED_STATUS_ID = 29;
 const AWAITING_BALANCE_PAYMENT_STATUS_ID = 30;

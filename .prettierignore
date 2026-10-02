@@ -1,0 +1,5 @@
+# Marked "never change this file"
+config/database.js
+yarn.lock
+
+.impeccable/

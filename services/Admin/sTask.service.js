@@ -1,4 +1,4 @@
-const { getPool } = require("../../config/dataBase.js");
+const { getPool } = require("../../config/database");
 
 // Create S_TASK
 const createSTaskService = async (body) => {

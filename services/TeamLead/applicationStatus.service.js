@@ -1,4 +1,4 @@
-const { getPool } = require("../../config/dataBase");
+const { getPool } = require("../../config/database");
 
 // Team Lead → Documents in Customer Review
 const updateApplicationStatusToCustomerReviewService = async (

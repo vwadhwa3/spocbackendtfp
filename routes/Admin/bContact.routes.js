@@ -3,7 +3,7 @@ const router = express.Router();
 
 const {
   createContactController,
-} = require("../../controllers/Admin/bContact.controllers.js");
+} = require("../../controllers/Admin/bContact.controller");
 
 router.post("/create", createContactController);
 
