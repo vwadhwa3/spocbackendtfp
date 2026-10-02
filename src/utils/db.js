@@ -1,4 +1,4 @@
-const { getPool } = require("../../config/database");
+const { getPool } = require("../../config/dataBase");
 
 const query = async (text, params) => {
   const pool = getPool();

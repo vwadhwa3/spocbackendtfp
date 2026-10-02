@@ -1,0 +1,11 @@
+✅ Firebase initialized.
+✅ Supabase JS client initialized.
+🔍 PG Config: {
+  host: 'aws-1-ap-northeast-1.pooler.supabase.com',
+  password: '✅ loaded'
+}
+>>> authRoutes module loaded
+>>> depositRoutes module loaded
+✅ PostgreSQL connected. Server time: 2026-10-02T13:17:34.315Z
+Database connection established, SPOCTFPBACKEND
+Server running on port 3002

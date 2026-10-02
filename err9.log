@@ -1,0 +1,3 @@
+◇ injected env (21) from .env
+◇ injected env (0) from .env
+❌ PostgreSQL connection failed: Connection terminated due to connection timeout undefined

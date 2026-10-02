@@ -13,6 +13,24 @@ const APPLICATION_STATUS = {
   APPLICATION_CREATED: 5,
 };
 
+const getEnabledBankAccounts = async (req, res) => {
+  try {
+    const bankAccounts = await paymentService.getEnabledBankAccounts();
+
+    return res.json({
+      success: true,
+      data: bankAccounts,
+    });
+  } catch (error) {
+    console.error("Get enabled bank accounts error:", error);
+    return res.status(500).json({
+      success: false,
+      error: "INTERNAL_ERROR",
+      message: "Failed to get enabled bank accounts",
+    });
+  }
+};
+
 const getMinimumDeposit = async (req, res) => {
   try {
     const { caseId } = req.params;
@@ -192,6 +210,7 @@ const getPayments = async (req, res) => {
 };
 
 module.exports = {
+  getEnabledBankAccounts,
   getMinimumDeposit,
   submitDeposit,
   getPayments,

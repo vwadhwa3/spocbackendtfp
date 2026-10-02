@@ -93,7 +93,18 @@ const checkCurrencyExists = async (currencyId) => {
     `SELECT currency_id, code, name FROM currency WHERE currency_id = $1`,
     [currencyId]
   );
-  
+
+  return result;
+};
+
+const getEnabledBankAccounts = async () => {
+  const result = await queryMany(
+    `SELECT bank_account_id, bank_name, account_name, currency_id
+     FROM bank_account
+     WHERE enabled = true
+     ORDER BY bank_name, account_name`
+  );
+
   return result;
 };
 
@@ -104,4 +115,5 @@ module.exports = {
   getPaymentById,
   checkBankAccountEnabled,
   checkCurrencyExists,
+  getEnabledBankAccounts,
 };
