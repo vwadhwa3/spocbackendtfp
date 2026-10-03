@@ -5,6 +5,7 @@ const { getSupabase } = require("../config/database");
 const JWT_SECRET =
   process.env.JWT_SECRET || "your-super-secret-jwt-key-change-in-production";
 const JWT_EXPIRES_IN = "8h";
+const CUSTOMER_JWT_EXPIRES_IN = "2h";
 
 const USER_COLUMNS =
   "user_id, email, password_hash, first_name, last_name, user_role_type_id, role(role_name)";
@@ -74,6 +75,13 @@ const decodeTokenService = (token) => {
   }
 };
 
+// Customer tokens are told apart from staff tokens by `type`; staff auth
+// rejects them.
+const signCustomerTokenService = (contactIds) =>
+  jwt.sign({ type: "customer", contactIds }, JWT_SECRET, {
+    expiresIn: CUSTOMER_JWT_EXPIRES_IN,
+  });
+
 // Get an active user by id, or null if missing or deactivated
 const getActiveUserService = async (userId) => {
   const user = await findActiveUser((q) => q.eq("user_id", userId));
@@ -84,4 +92,5 @@ module.exports = {
   loginService,
   decodeTokenService,
   getActiveUserService,
+  signCustomerTokenService,
 };

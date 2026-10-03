@@ -1,5 +1,6 @@
 const { fromZonedTime } = require("date-fns-tz");
 const { getSupabase } = require("../config/database");
+const { startInfoFormStageService } = require("./infoForm.service");
 
 const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
 // Wall-clock time as the SPOC sees it, no offset: 2026-09-30T14:05 or 2026-09-30T14:05:00
@@ -414,6 +415,21 @@ const submitDepositService = async (caseId, body, userId) => {
       applications = ids.length ? splitEqually(totalCents, ids) : [];
     }
 
+    // The deposit is complete at this point, so a failure here is reported
+    // rather than undoing it; POST /api/cases/:caseId/info-form/start retries.
+    let infoForm = null;
+    let infoFormError = null;
+    if (meetsMinimum) {
+      try {
+        infoForm = await startInfoFormStageService(caseId, userId);
+      } catch (error) {
+        console.error("Info form stage failed:", error);
+        infoFormError = error.statusCode
+          ? error.message
+          : "Info form setup failed";
+      }
+    }
+
     return {
       case_id: caseId,
       case_status: nextStatusCode,
@@ -423,6 +439,8 @@ const submitDepositService = async (caseId, body, userId) => {
       payments: createdPayments,
       discount: createdDiscount,
       applications,
+      info_form: infoForm,
+      info_form_error: infoFormError,
     };
   } catch (error) {
     for (const step of undo.reverse()) {

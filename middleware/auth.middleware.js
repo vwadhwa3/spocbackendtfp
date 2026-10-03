@@ -38,7 +38,7 @@ const authenticate = async (req, res, next) => {
 
     const decoded = decodeTokenService(token);
 
-    if (!decoded) {
+    if (!decoded || decoded.type === "customer") {
       return res.status(401).json({
         success: false,
         error: "INVALID_TOKEN",
@@ -68,6 +68,28 @@ const authenticate = async (req, res, next) => {
   }
 };
 
+// For Customer Lead endpoints; sets req.customer instead of req.user.
+const authenticateCustomer = (req, res, next) => {
+  const token = getToken(req);
+  const decoded = token ? decodeTokenService(token) : null;
+
+  if (
+    decoded?.type !== "customer" ||
+    !Array.isArray(decoded.contactIds) ||
+    decoded.contactIds.length === 0
+  ) {
+    return res.status(401).json({
+      success: false,
+      error: "INVALID_TOKEN",
+      message: "Customer token required",
+    });
+  }
+
+  req.customer = { contactIds: decoded.contactIds };
+  next();
+};
+
 module.exports = {
   authenticate,
+  authenticateCustomer,
 };
