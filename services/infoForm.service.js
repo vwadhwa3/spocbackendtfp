@@ -50,19 +50,18 @@ const getCaseStatusId = async (supabase, statusCode) => {
   return row.status_id;
 };
 
-// Same status the deposit flow gives existing applications.
+// The status every application starts the info form stage in.
 const getApplicationCreatedStatusId = async (supabase) => {
   const row = await run(
     supabase
       .from("app_status")
       .select("status_id")
-      .eq("label", "Application Created")
+      .eq("status_code", "created")
       .eq("is_active", 1)
       .is("discontinued_at", null)
       .maybeSingle(),
   );
-  if (!row)
-    throw new Error("app_status 'Application Created' is not configured");
+  if (!row) throw new Error("app_status 'created' is not configured");
   return row.status_id;
 };
 
@@ -235,6 +234,20 @@ const startInfoFormStageService = async (caseId, userId) => {
   const missingForms = applicationIds.filter((id) => !formAppIds.has(id));
 
   if (missingForms.length > 0) {
+    // Applications that existed before the case was created haven't entered
+    // the info form stage yet, so they start it in Created like the new ones.
+    await run(
+      supabase
+        .from("b_applications")
+        .update({
+          status_id: applicationCreatedId,
+          updated_by: actor,
+          updation_timestamp: new Date().toISOString(),
+        })
+        .in("application_id", missingForms)
+        .neq("status_id", applicationCreatedId),
+    );
+
     await run(
       supabase.from("application_form").insert(
         missingForms.map((application_id) => ({

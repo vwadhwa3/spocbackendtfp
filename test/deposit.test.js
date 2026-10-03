@@ -3,6 +3,7 @@ const assert = require("node:assert");
 const {
   splitEqually,
   validateSubmission,
+  validateReview,
 } = require("../services/deposit.service");
 const { ROLES, requireRole } = require("../middleware/role.middleware");
 
@@ -75,6 +76,19 @@ test("splits deposit equally and the shares add up to the total", () => {
     { application_id: "7", allocated_deposit_amount: 33.34 },
     { application_id: "8", allocated_deposit_amount: 33.33 },
     { application_id: "9", allocated_deposit_amount: 33.33 },
+  ]);
+});
+
+test("review needs approve or reject; comments are optional text", () => {
+  const reviewFields = (body) => validateReview(body).map((e) => e.field);
+  assert.deepStrictEqual(reviewFields({ decision: "approve" }), []);
+  assert.deepStrictEqual(
+    reviewFields({ decision: "reject", comments: "Short by 200" }),
+    [],
+  );
+  assert.deepStrictEqual(reviewFields({ decision: "maybe", comments: 5 }), [
+    "decision",
+    "comments",
   ]);
 });
 

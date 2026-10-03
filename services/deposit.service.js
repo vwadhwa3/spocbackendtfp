@@ -142,20 +142,18 @@ const getCaseStatusId = async (supabase, statusCode) => {
   return row.status_id;
 };
 
-// app_status 'Application Created' has no status_code, so it is found by label.
-const getApplicationCreatedStatusId = async (supabase) => {
+const getTaskTypeId = async (supabase, taskTypeCode) => {
   const row = await run(
     supabase
-      .from("app_status")
-      .select("status_id")
-      .eq("label", "Application Created")
+      .from("s_task")
+      .select("task_type_id")
+      .eq("task_type_code", taskTypeCode)
       .eq("is_active", 1)
       .is("discontinued_at", null)
       .maybeSingle(),
   );
-  if (!row)
-    throw new Error("app_status 'Application Created' is not configured");
-  return row.status_id;
+  if (!row) throw new Error(`s_task '${taskTypeCode}' is not configured`);
+  return row.task_type_id;
 };
 
 const findCase = async (supabase, caseId) => {
@@ -229,6 +227,31 @@ const getPaymentsService = async (caseId) => {
   }));
 };
 
+// Runs the Case Created step and splits the deposit across the applications.
+// The deposit is complete by then, so a failure here is reported rather than
+// undoing it; POST /api/cases/:caseId/info-form/start retries.
+// The split is returned, not stored: b_applications has no column for it.
+const startCaseCreated = async (caseId, totalCents, userId) => {
+  try {
+    const infoForm = await startInfoFormStageService(caseId, userId);
+    const ids = [...infoForm.application_ids].sort((a, b) => a - b);
+    return {
+      applications: ids.length ? splitEqually(totalCents, ids) : [],
+      info_form: infoForm,
+      info_form_error: null,
+    };
+  } catch (error) {
+    console.error("Info form stage failed:", error);
+    return {
+      applications: [],
+      info_form: null,
+      info_form_error: error.statusCode
+        ? error.message
+        : "Info form setup failed",
+    };
+  }
+};
+
 // Submit Initial Deposit
 //
 // The Supabase client has no transactions, so every check runs before the
@@ -296,9 +319,9 @@ const submitDepositService = async (caseId, body, userId) => {
     ? "case_created"
     : "deposit_amount_review";
   const nextStatusId = await getCaseStatusId(supabase, nextStatusCode);
-  const applicationCreatedId = meetsMinimum
-    ? await getApplicationCreatedStatusId(supabase)
-    : null;
+  const depositReviewTaskTypeId = meetsMinimum
+    ? null
+    : await getTaskTypeId(supabase, "DepositReview");
 
   // ---- Writes ----
   const undo = [];
@@ -396,39 +419,29 @@ const submitDepositService = async (caseId, body, userId) => {
       );
     }
 
-    // The split is returned, not stored: b_applications has no column for it.
-    let applications = [];
-    if (meetsMinimum) {
-      const updated = await run(
+    // A shortfall waits for a Lead Consultant to approve or reject it.
+    let reviewTask = null;
+    if (!meetsMinimum) {
+      reviewTask = await run(
         supabase
-          .from("b_applications")
-          .update({
-            status_id: applicationCreatedId,
-            updated_by: actor,
-            updation_timestamp: now(),
+          .from("task")
+          .insert({
+            case_id: caseId,
+            task_type_id: depositReviewTaskTypeId,
+            role_required: "Lead Consultant",
+            status: "pending",
+            description: `Review initial deposit of ${fromCents(totalCents)} ${bCase.currency.iso_code} against the minimum of ${fromCents(minimumCents)}`,
+            created_by_user_id: userId,
+            created_by: actor,
           })
-          .eq("case_id", caseId)
-          .is("discontinued_at", null)
-          .select("application_id"),
+          .select("task_id, status, description")
+          .single(),
       );
-      const ids = updated.map((a) => a.application_id).sort((a, b) => a - b);
-      applications = ids.length ? splitEqually(totalCents, ids) : [];
     }
 
-    // The deposit is complete at this point, so a failure here is reported
-    // rather than undoing it; POST /api/cases/:caseId/info-form/start retries.
-    let infoForm = null;
-    let infoFormError = null;
-    if (meetsMinimum) {
-      try {
-        infoForm = await startInfoFormStageService(caseId, userId);
-      } catch (error) {
-        console.error("Info form stage failed:", error);
-        infoFormError = error.statusCode
-          ? error.message
-          : "Info form setup failed";
-      }
-    }
+    const caseCreated = meetsMinimum
+      ? await startCaseCreated(caseId, totalCents, userId)
+      : { applications: [], info_form: null, info_form_error: null };
 
     return {
       case_id: caseId,
@@ -438,9 +451,8 @@ const submitDepositService = async (caseId, body, userId) => {
       shortfall: fromCents(Math.max(0, minimumCents - totalCents)),
       payments: createdPayments,
       discount: createdDiscount,
-      applications,
-      info_form: infoForm,
-      info_form_error: infoFormError,
+      review_task: reviewTask,
+      ...caseCreated,
     };
   } catch (error) {
     for (const step of undo.reverse()) {
@@ -459,11 +471,184 @@ const submitDepositService = async (caseId, body, userId) => {
   }
 };
 
+const REVIEW_DECISIONS = ["approve", "reject"];
+
+// Returns a list of { field, message }; empty when the body is valid.
+const validateReview = ({ decision, comments }) => {
+  const errors = [];
+  if (!REVIEW_DECISIONS.includes(decision)) {
+    errors.push({
+      field: "decision",
+      message: "Decision must be approve or reject",
+    });
+  }
+  if (comments != null && typeof comments !== "string") {
+    errors.push({ field: "comments", message: "Comments must be text" });
+  }
+  return errors;
+};
+
+// Review Deposit Shortfall
+//
+// A Lead Consultant decides a deposit below the minimum. Approve accepts it
+// and moves the case to Case Created; reject sends the case back to Pending
+// Initial Deposit so the SPOC can enter it again. Writes are undone the same
+// way as in Submit Initial Deposit.
+const reviewDepositService = async (caseId, body, userId) => {
+  const errors = validateReview(body);
+  if (errors.length > 0) {
+    throw depositError(400, "VALIDATION_ERROR", errors[0].message, errors);
+  }
+
+  const supabase = getSupabase();
+  const { decision } = body;
+  const approve = decision === "approve";
+  const comments = body.comments?.trim() || null;
+  const actor = String(userId);
+  const now = () => new Date().toISOString();
+
+  // ---- Checks (no writes) ----
+  const bCase = await findCase(supabase, caseId);
+
+  if (bCase.case_status.status_code !== "deposit_amount_review") {
+    throw depositError(
+      409,
+      "INVALID_CASE_STATUS",
+      "Case is not in Deposit Amount Review status",
+    );
+  }
+
+  const pendingPayments = await run(
+    supabase
+      .from("payment")
+      .select("payment_id, amount")
+      .eq("case_id", caseId)
+      .eq("type", "initial_deposit")
+      .eq("status", "pending")
+      .is("discontinued_at", null),
+  );
+  if (pendingPayments.length === 0) {
+    throw depositError(
+      409,
+      "NO_PENDING_DEPOSIT",
+      "Case has no pending deposit to review",
+    );
+  }
+
+  const nextStatusCode = approve ? "case_created" : "pending_initial_deposit";
+  const [nextStatusId, depositReviewTaskTypeId] = await Promise.all([
+    getCaseStatusId(supabase, nextStatusCode),
+    getTaskTypeId(supabase, "DepositReview"),
+  ]);
+  const totalCents = pendingPayments.reduce(
+    (sum, p) => sum + toCents(p.amount),
+    0,
+  );
+  const paymentIds = pendingPayments.map((p) => p.payment_id);
+
+  // ---- Writes ----
+  const undo = [];
+  let payments;
+  let reviewTasks;
+
+  try {
+    // Same claim as on submit, so two reviewers can't both decide.
+    const claimed = await run(
+      supabase
+        .from("b_case")
+        .update({
+          status_id: nextStatusId,
+          // A rejected deposit no longer counts as received.
+          initial_deposit_received: approve ? fromCents(totalCents) : 0,
+          updated_by: actor,
+          updation_timestamp: now(),
+        })
+        .eq("case_id", caseId)
+        .eq("status_id", bCase.status_id)
+        .select("case_id"),
+    );
+    if (claimed.length === 0) {
+      throw depositError(
+        409,
+        "INVALID_CASE_STATUS",
+        "Case is not in Deposit Amount Review status",
+      );
+    }
+    undo.push(() =>
+      supabase
+        .from("b_case")
+        .update({
+          status_id: bCase.status_id,
+          initial_deposit_received: bCase.initial_deposit_received,
+        })
+        .eq("case_id", caseId),
+    );
+
+    payments = await run(
+      supabase
+        .from("payment")
+        .update({
+          status: approve ? "approved" : "rejected",
+          updated_by: actor,
+          updation_timestamp: now(),
+        })
+        .in("payment_id", paymentIds)
+        .select("payment_id, amount, payment_reference, status"),
+    );
+    undo.push(() =>
+      supabase
+        .from("payment")
+        .update({ status: "pending" })
+        .in("payment_id", paymentIds),
+    );
+
+    reviewTasks = await run(
+      supabase
+        .from("task")
+        .update({
+          status: "completed",
+          decision,
+          comments,
+          updated_by: actor,
+          updation_timestamp: now(),
+        })
+        .eq("case_id", caseId)
+        .eq("task_type_id", depositReviewTaskTypeId)
+        .eq("status", "pending")
+        .is("discontinued_at", null)
+        .select("task_id, status, decision"),
+    );
+  } catch (error) {
+    for (const step of undo.reverse()) {
+      const { error: undoError } = await step();
+      if (undoError) console.error("Deposit review undo failed:", undoError);
+    }
+    throw error;
+  }
+
+  const caseCreated = approve
+    ? await startCaseCreated(caseId, totalCents, userId)
+    : { applications: [], info_form: null, info_form_error: null };
+
+  return {
+    case_id: caseId,
+    case_status: nextStatusCode,
+    decision,
+    total_paid: approve ? fromCents(totalCents) : 0,
+    minimum_deposit_amount: Number(bCase.minimum_deposit_amount),
+    payments,
+    review_tasks: reviewTasks,
+    ...caseCreated,
+  };
+};
+
 module.exports = {
   getEnabledBankAccountsService,
   getCaseDepositService,
   getPaymentsService,
   submitDepositService,
+  reviewDepositService,
   splitEqually,
   validateSubmission,
+  validateReview,
 };

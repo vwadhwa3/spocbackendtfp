@@ -3,6 +3,7 @@ const {
   getCaseDepositService,
   getPaymentsService,
   submitDepositService,
+  reviewDepositService,
 } = require("../services/deposit.service");
 
 const sendError = (res, error) => {
@@ -71,9 +72,20 @@ const submitDepositController = handle(async (req, res) => {
   res.status(201).json({ success: true, data });
 });
 
+// Review Deposit Shortfall
+const reviewDepositController = handle(async (req, res) => {
+  const data = await reviewDepositService(
+    parseCaseId(req),
+    req.body ?? {},
+    req.user.userId,
+  );
+  res.json({ success: true, data });
+});
+
 module.exports = {
   getEnabledBankAccountsController,
   getCaseDepositController,
   getPaymentsController,
   submitDepositController,
+  reviewDepositController,
 };
