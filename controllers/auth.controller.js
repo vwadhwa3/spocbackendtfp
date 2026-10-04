@@ -33,6 +33,16 @@ const loginController = async (req, res) => {
   }
 };
 
+// Verify Token
+// authenticate has already checked the token and reloaded the user, so the
+// role returned here is the one in the database, not the one in the token.
+const verifyController = (req, res) =>
+  res.json({
+    success: true,
+    data: { user: req.user },
+  });
+
 module.exports = {
   loginController,
+  verifyController,
 };

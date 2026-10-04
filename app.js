@@ -13,6 +13,7 @@ const { db } = require("./config/database");
 const authRoutes = require("./routes/auth.routes");
 const depositRoutes = require("./routes/deposit.routes");
 const infoFormRoutes = require("./routes/infoForm.routes");
+const lookupRoutes = require("./routes/lookup.routes");
 const customerRoutes = require("./routes/customer.routes");
 const visaCategoryRoutes = require("./routes/visaCategory.routes");
 const visaHistoryRoutes = require("./routes/visaHistory.routes");
@@ -157,6 +158,7 @@ app.get("/metrics", async (req, res) => {
 app.use("/api/auth", authRoutes);
 app.use("/api", depositRoutes);
 app.use("/api", infoFormRoutes);
+app.use("/api", lookupRoutes);
 app.use("/api/customer", customerRoutes);
 
 app.use("/visa-category", visaCategoryRoutes);
