@@ -119,6 +119,30 @@ const getUsersByRoleService = async (roleId) =>
       .order("last_name"),
   );
 
+// Get Genders
+const getGendersService = async () =>
+  run(getSupabase().from("gender").select("gender_id, label").order("label"));
+
+// Get Marital Statuses
+const getMaritalStatusesService = async () =>
+  run(
+    getSupabase()
+      .from("marital_status")
+      .select("marital_status_id, code, label")
+      .order("marital_status_id"),
+  );
+
+// Get Travel Document Types
+// The wizard sends `code`; it is what b_contact.travel_document_type stores.
+const getTravelDocumentTypesService = async () =>
+  run(
+    getSupabase()
+      .from("travel_doc_type")
+      .select("travel_doc_type_id, code, label")
+      .is("discontinued_at", null)
+      .order("travel_doc_type_id"),
+  );
+
 module.exports = {
   getCountriesService,
   getCitiesService,
@@ -127,6 +151,9 @@ module.exports = {
   getAddOnPacksService,
   getBankAccountsService,
   getUsersByRoleService,
+  getGendersService,
+  getMaritalStatusesService,
+  getTravelDocumentTypesService,
   parseAssignableRole,
   parseCountryId,
 };

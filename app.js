@@ -15,6 +15,7 @@ const depositRoutes = require("./routes/deposit.routes");
 const infoFormRoutes = require("./routes/infoForm.routes");
 const lookupRoutes = require("./routes/lookup.routes");
 const customerRoutes = require("./routes/customer.routes");
+const caseRoutes = require("./routes/case.routes");
 const visaCategoryRoutes = require("./routes/visaCategory.routes");
 const visaHistoryRoutes = require("./routes/visaHistory.routes");
 const travelInfoRoutes = require("./routes/travelInfo.routes");
@@ -160,6 +161,7 @@ app.use("/api", depositRoutes);
 app.use("/api", infoFormRoutes);
 app.use("/api", lookupRoutes);
 app.use("/api/customer", customerRoutes);
+app.use("/api/case", caseRoutes);
 
 app.use("/visa-category", visaCategoryRoutes);
 app.use("/visa-history", visaHistoryRoutes);

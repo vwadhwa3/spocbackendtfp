@@ -648,7 +648,11 @@ module.exports = {
   getPaymentsService,
   submitDepositService,
   reviewDepositService,
+  startCaseCreated,
   splitEqually,
   validateSubmission,
   validateReview,
+  isValidTimeZone,
+  toCents,
+  fromCents,
 };

@@ -12,6 +12,9 @@ const {
   getAddOnPacksController,
   getBankAccountsController,
   getUsersByRoleController,
+  getGendersController,
+  getMaritalStatusesController,
+  getTravelDocumentTypesController,
 } = require("../controllers/lookup.controller");
 
 // Add New Case wizard dropdowns. The data isn't role-sensitive, but the routes
@@ -40,5 +43,18 @@ router.get("/bank-accounts", spocOnly, getBankAccountsController);
 
 // Get Users By Role
 router.get("/users", spocOnly, getUsersByRoleController);
+
+// Get Genders
+router.get("/genders", spocOnly, getGendersController);
+
+// Get Marital Statuses
+router.get("/marital-statuses", spocOnly, getMaritalStatusesController);
+
+// Get Travel Document Types
+router.get(
+  "/travel-document-types",
+  spocOnly,
+  getTravelDocumentTypesController,
+);
 
 module.exports = router;

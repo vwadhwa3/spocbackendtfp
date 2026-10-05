@@ -6,6 +6,9 @@ const {
   getAddOnPacksService,
   getBankAccountsService,
   getUsersByRoleService,
+  getGendersService,
+  getMaritalStatusesService,
+  getTravelDocumentTypesService,
   parseAssignableRole,
   parseCountryId,
 } = require("../services/lookup.service");
@@ -61,6 +64,17 @@ const getUsersByRoleController = handle((req) =>
   getUsersByRoleService(parseAssignableRole(req.query.role)),
 );
 
+// Get Genders
+const getGendersController = handle(() => getGendersService());
+
+// Get Marital Statuses
+const getMaritalStatusesController = handle(() => getMaritalStatusesService());
+
+// Get Travel Document Types
+const getTravelDocumentTypesController = handle(() =>
+  getTravelDocumentTypesService(),
+);
+
 module.exports = {
   getCountriesController,
   getCitiesController,
@@ -69,4 +83,7 @@ module.exports = {
   getAddOnPacksController,
   getBankAccountsController,
   getUsersByRoleController,
+  getGendersController,
+  getMaritalStatusesController,
+  getTravelDocumentTypesController,
 };
