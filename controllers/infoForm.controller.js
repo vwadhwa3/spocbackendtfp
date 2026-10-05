@@ -54,6 +54,12 @@ const startInfoFormStageController = handle(async (req, res) => {
 // Customer Login
 const customerLoginController = handle(async (req, res) => {
   const data = await customerLoginService(req.body ?? {});
+  res.cookie("token", data.token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "lax",
+    maxAge: 2 * 60 * 60 * 1000,
+  });
   res.json({ success: true, data });
 });
 
