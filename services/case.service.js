@@ -1,6 +1,10 @@
 const { randomUUID } = require("node:crypto");
 const { fromZonedTime, formatInTimeZone } = require("date-fns-tz");
-const { getPool, getSupabase } = require("../config/database");
+const {
+  db: connectDatabases,
+  getPool,
+  getSupabase,
+} = require("../config/database");
 const { ROLES } = require("../middleware/role.middleware");
 const {
   t,
@@ -87,10 +91,31 @@ const isOptionalIdList = (value) =>
 
 const uniqueIds = (values) => [...new Set((values ?? []).map(Number))];
 
-const getDb = () => {
+// If the startup connection test failed, config/database.js leaves no pool
+// and nothing retries it; try setting it up again before giving up.
+const getDb = async () => {
+  if (!getPool()) await connectDatabases();
   const pool = getPool();
   if (!pool) throw new Error("PostgreSQL pool is not available");
   return pool;
+};
+
+// Runs fn with one pooled connection. Queries fired together on one client
+// queue up on it; on the pool, each opens its own connection to the remote
+// pooler, and a burst of them hit connectionTimeoutMillis.
+const withClient = async (fn) => {
+  const client = await (await getDb()).connect();
+  let broken;
+  try {
+    return await fn(client);
+  } catch (error) {
+    // A database failure may have left the connection unusable, so it is
+    // dropped instead of going back to the pool. Request errors keep it.
+    if (!error.statusCode) broken = error;
+    throw error;
+  } finally {
+    client.release(broken);
+  }
 };
 
 const getTravelDocumentsBucket = () => {
@@ -551,22 +576,23 @@ const getMinimumDepositService = async (query) => {
   );
   const addOnPackIds = parseIdList(query.add_on_pack_ids, "add_on_pack_ids");
 
-  const db = getDb();
-  const city = await getApplicationCountryId(
-    db,
-    applicationCityId,
-    destinationCountryId,
-  );
-  if (city.error) throw caseError(400, "VALIDATION_ERROR", city.error);
+  return withClient(async (db) => {
+    const city = await getApplicationCountryId(
+      db,
+      applicationCityId,
+      destinationCountryId,
+    );
+    if (city.error) throw caseError(400, "VALIDATION_ERROR", city.error);
 
-  const quote = await quoteDeposit(db, {
-    destinationCountryId,
-    applicationCountryId: city.countryId,
-    servicePackIds,
-    addOnPackIds,
+    const quote = await quoteDeposit(db, {
+      destinationCountryId,
+      applicationCountryId: city.countryId,
+      servicePackIds,
+      addOnPackIds,
+    });
+
+    return formatQuote(quote, await getCurrencyCode(db, quote.currency_id));
   });
-
-  return formatQuote(quote, await getCurrencyCode(db, quote.currency_id));
 };
 
 // Deposit at or above the minimum opens the case straight away; a shortfall
@@ -578,6 +604,375 @@ const decideDeposit = (totalCents, minimumCents) => {
     statusCode: meetsMinimum ? "case_created" : "deposit_amount_review",
     paymentStatus: meetsMinimum ? "approved" : "pending",
   };
+};
+
+/* ===================== LIST ===================== */
+
+// Every open case with the names the SPOC case list and dashboard show, plus
+// each applicant's application status (the dashboard's stages). Read-only.
+// Dates are cast to text so the pg driver doesn't shift them by timezone.
+const LIST_CASES_SQL = `
+  select c.case_id,
+         c.lead_contact_id,
+         lc.whatsapp_number as lead_whatsapp_number,
+         lc.first_name as lead_first_name,
+         lc.surname as lead_surname,
+         (select count(*)::int from b_case_application ca
+          where ca.case_id = c.case_id and ca.discontinued_at is null) as applicant_count,
+         city.name as application_city,
+         dc.name as destination_country,
+         vc.name as visa_category,
+         c.tentative_travel_date::text as tentative_travel_date,
+         nullif(concat_ws(' ', csr.first_name, csr.last_name), '') as assigned_csr,
+         nullif(concat_ws(' ', tl.first_name, tl.last_name), '') as assigned_team_lead,
+         cs.status_code,
+         cs.label as status_label,
+         coalesce(c.updation_timestamp, c.creation_timestamp) as updated_at,
+         (select coalesce(json_agg(json_build_object(
+                   'application_id', a.application_id,
+                   'first_name', ac.first_name,
+                   'surname', ac.surname,
+                   'status_code', s.status_code,
+                   'status_label', s.label,
+                   'is_terminal', s.is_terminal
+                 ) order by ca.sequence_number nulls last, a.application_id), '[]'::json)
+          from b_applications a
+          left join b_contact ac on ac.contact_id = a.applicant_id
+          left join app_status s on s.status_id = a.status_id
+          left join b_case_application ca
+            on ca.case_id = a.case_id and ca.applicant_id = a.applicant_id
+           and ca.discontinued_at is null
+          where a.case_id = c.case_id and a.discontinued_at is null) as applications
+  from b_case c
+  left join b_contact lc on lc.contact_id = c.lead_contact_id
+  left join city on city.city_id = c.application_city_id
+  left join country dc on dc.country_id = c.destination_country_id
+  left join visa_category vc on vc.visa_category_id = c.visa_category_id
+  left join s_user csr on csr.user_id = c.assigned_csr_user_id
+  left join s_user tl on tl.user_id = c.assigned_team_lead_user_id
+  left join case_status cs on cs.status_id = c.status_id
+  where c.discontinued_at is null
+  order by updated_at desc nulls last, c.case_id desc`;
+
+// List Cases
+const listCasesService = async () =>
+  (await (await getDb()).query(LIST_CASES_SQL)).rows;
+
+/* ===================== CUSTOMER DETAIL ===================== */
+
+// The Directory's customer page: the case a customer lead belongs to, its
+// packs and every applicant's details. Read-only. Payments come from
+// GET /api/cases/:caseId/deposit/payments.
+
+const CUSTOMER_CASE_SQL = `
+  select c.case_id,
+         c.lead_contact_id,
+         lc.first_name as lead_first_name,
+         lc.surname as lead_surname,
+         lc.whatsapp_number as lead_whatsapp_number,
+         city.name as application_city,
+         dc.name as destination_country,
+         vc.name as visa_category,
+         c.tentative_travel_date::text as tentative_travel_date,
+         nullif(concat_ws(' ', csr.first_name, csr.last_name), '') as assigned_csr,
+         nullif(concat_ws(' ', tl.first_name, tl.last_name), '') as assigned_team_lead,
+         cs.status_code,
+         cs.label as status_label,
+         c.minimum_deposit_amount,
+         cur.iso_code as currency_code
+  from b_case c
+  left join b_contact lc on lc.contact_id = c.lead_contact_id
+  left join city on city.city_id = c.application_city_id
+  left join country dc on dc.country_id = c.destination_country_id
+  left join visa_category vc on vc.visa_category_id = c.visa_category_id
+  left join s_user csr on csr.user_id = c.assigned_csr_user_id
+  left join s_user tl on tl.user_id = c.assigned_team_lead_user_id
+  left join case_status cs on cs.status_id = c.status_id
+  left join currency cur on cur.currency_id = c.currency_id
+  where c.lead_contact_id = $1 and c.discontinued_at is null
+  order by c.case_id desc
+  limit 1`;
+
+const CUSTOMER_PACKS_SQL = `
+  select bp.pack_type, coalesce(sp.name, ap.name) as name,
+         bp.price_at_booking
+  from b_case_service_pack bp
+  left join service_pack sp
+    on bp.pack_type = 'service' and sp.service_pack_id = bp.pack_id
+  left join add_on_pack ap
+    on bp.pack_type = 'addon' and ap.add_on_pack_id = bp.pack_id
+  where bp.case_id = $1
+  order by bp.pack_type desc, name`;
+
+// One row per applicant: their contact details plus each section of their
+// info form (null until the customer fills it in). Dates are cast to text so
+// the pg driver doesn't shift them by timezone.
+const CUSTOMER_APPLICANTS_SQL = `
+  select a.application_id,
+         a.vac_account_required,
+         a.vac_alias,
+         a.vac_password,
+         s.label as status_label,
+         f.form_id,
+         ct.first_name,
+         ct.surname,
+         ct.had_different_name,
+         ct.previous_name,
+         ct.date_of_birth::text as date_of_birth,
+         ct.phone_number,
+         ct.whatsapp_number,
+         ct.email,
+         pob.name as place_of_birth,
+         coalesce(cob.name, pobc.name) as country_of_birth,
+         nat.name as nationality,
+         g.label as gender,
+         ms.label as marital_status,
+         tdt.label as travel_document_type,
+         ct.travel_document_number,
+         ct.issue_date::text as issue_date,
+         ct.expiry_date::text as expiry_date,
+         (select json_build_object(
+                   'postcode', ai.postcode,
+                   'address_line1', ai.address_line1,
+                   'address_line2', ai.address_line2,
+                   'city', ai.city,
+                   'county', ai.county,
+                   'country', aic.name,
+                   'mobile_number', ai.mobile_number,
+                   'whatsapp_number', ai.whatsapp_number,
+                   'email', ai.email)
+          from address_info ai
+          left join country aic on aic.country_id = ai.country_id
+          where ai.form_id = f.form_id and ai.discontinued_at is null
+          order by ai.address_info_id desc limit 1) as address,
+         (select json_build_object(
+                   'permit_type', pt.label,
+                   'permit_number', rp.permit_number,
+                   'issue_date', rp.issue_date::text,
+                   'expiry_date', rp.expiry_date::text,
+                   'issuing_country', rpc.name)
+          from residence_permit rp
+          left join permit_type pt on pt.permit_type_id = rp.permit_type_id
+          left join country rpc on rpc.country_id = rp.issuing_country_id
+          where rp.form_id = f.form_id and rp.discontinued_at is null
+          order by rp.residence_permit_id desc limit 1) as residence_permit,
+         (select json_build_object(
+                   'occupation', coalesce(oc.label, oi.occupation_category),
+                   'employer_name', oi.employer_name,
+                   'job_title', oi.job_title,
+                   'start_date', oi.start_date::text,
+                   'employer_address', oi.employer_address,
+                   'employer_email', oi.employer_email,
+                   'employer_phone', oi.employer_phone,
+                   'gross_annual_earnings', oi.gross_annual_earnings)
+          from occupation_info oi
+          left join occupation_category oc on oc.code = oi.occupation_category
+          where oi.form_id = f.form_id and oi.discontinued_at is null
+          order by oi.occupation_info_id desc limit 1) as occupation,
+         (select json_build_object(
+                   'had_schengen_visa_last_59_months', vh.had_schengen_visa_last_59_months,
+                   'previous_biometrics_date', vh.previous_biometrics_date::text,
+                   'visa_sticker_number', vh.visa_sticker_number,
+                   'visa_valid_from', vh.visa_valid_from::text,
+                   'visa_valid_to', vh.visa_valid_to::text,
+                   'issuing_country', vhc.name)
+          from visa_history vh
+          left join country vhc on vhc.country_id = vh.issuing_country_id
+          where vh.form_id = f.form_id and vh.discontinued_at is null
+          order by vh.visa_history_id desc limit 1) as visa_history,
+         (select json_build_object(
+                   'funding_source', coalesce(fs.label, fi.funding_source),
+                   'sponsor_first_name', fi.sponsor_first_name,
+                   'sponsor_surname', fi.sponsor_surname,
+                   'sponsor_gender', fi.sponsor_gender,
+                   'sponsor_address', fi.sponsor_address,
+                   'sponsor_country', fic.name,
+                   'sponsor_contact_number', fi.sponsor_contact_number,
+                   'sponsor_email', fi.sponsor_email,
+                   'sponsor_occupation', coalesce(foc.label, fi.sponsor_occupation_category),
+                   'joins_eu_family_member', fi.joins_eu_family_member)
+          from financing_info fi
+          left join funding_source fs on fs.code = fi.funding_source
+          left join country fic on fic.country_id = fi.sponsor_country_id
+          left join occupation_category foc on foc.code = fi.sponsor_occupation_category
+          where fi.form_id = f.form_id and fi.discontinued_at is null
+          order by fi.financing_info_id desc limit 1) as financing,
+         (select oth.notes
+          from other_info oth
+          where oth.form_id = f.form_id and oth.discontinued_at is null
+          order by oth.other_info_id desc limit 1) as other_notes,
+         (select coalesce(vcat.name, ti.visa_type)
+          from travel_info ti
+          left join visa_category vcat on vcat.code = ti.visa_type
+          where ti.form_id = f.form_id and ti.discontinued_at is null
+          order by ti.travel_info_id desc limit 1) as travel_visa_type
+  from b_applications a
+  join b_contact ct on ct.contact_id = a.applicant_id
+  left join b_case_application ca
+    on ca.case_id = a.case_id and ca.applicant_id = a.applicant_id
+   and ca.discontinued_at is null
+  left join lateral (
+    select form_id from application_form
+    where application_id = a.application_id and discontinued_at is null
+    order by form_id desc limit 1
+  ) f on true
+  left join city pob on pob.city_id = ct.place_of_birth_id
+  left join country pobc on pobc.country_id = pob.country_id
+  left join country cob on cob.country_id = ct.country_of_birth_id
+  left join country nat on nat.country_id = ct.nationality_id
+  left join gender g on g.gender_id = ct.gender_id
+  left join marital_status ms on ms.marital_status_id = ct.marital_status_id
+  left join travel_doc_type tdt on tdt.code = ct.travel_document_type
+  left join app_status s on s.status_id = a.status_id
+  where a.case_id = $1 and a.discontinued_at is null
+  order by ca.sequence_number nulls last, a.application_id`;
+
+// Documents for the case, newest first: uploads in attachment, plus the
+// travel document each applicant's contact got on Add New Case (stored on
+// b_contact, not in attachment). Listing only: the files aren't served.
+const CUSTOMER_DOCUMENTS_SQL = `
+  select * from (
+    select 'attachment-' || at.attachment_id as document_key,
+           at.application_id,
+           coalesce(dt.name, at.file_name) as document_name,
+           dc.name as document_category,
+           case when at.uploaded_by_customer = 1
+                then nullif(concat_ws(' ', uc.first_name, uc.surname), '')
+                else nullif(concat_ws(' ', u.first_name, u.last_name), '')
+           end as uploader,
+           at.uploaded_at
+    from attachment at
+    left join document_type dt on dt.document_type_id = at.document_type_id
+    left join document_category dc on dc.document_category_id = dt.document_category_id
+    left join s_user u on u.user_id = at.uploaded_by_user_id
+    left join b_applications ua on ua.application_id = at.application_id
+    left join b_contact uc on uc.contact_id = ua.applicant_id
+    where at.case_id = $1 and at.discontinued_at is null
+
+    union all
+
+    select 'travel-document-' || ct.contact_id,
+           a.application_id,
+           concat(coalesce(tdt.label, 'Travel document'), ' (',
+                  concat_ws(' ', ct.first_name, ct.surname), ')'),
+           'Travel document',
+           nullif(concat_ws(' ', u.first_name, u.last_name), ''),
+           ct.creation_timestamp
+    from b_applications a
+    join b_contact ct on ct.contact_id = a.applicant_id
+    left join travel_doc_type tdt on tdt.code = ct.travel_document_type
+    left join s_user u on u.user_id::text = ct.created_by
+    where a.case_id = $1 and a.discontinued_at is null
+      and ct.discontinued_at is null
+      and ct.travel_document_file_path is not null
+  ) documents
+  order by uploaded_at desc nulls last, document_key`;
+
+// Get Customer
+const getCustomerService = async (contactIdParam) => {
+  const contactId = parseId(contactIdParam, "contactId");
+
+  return withClient(async (db) => {
+    const { rows } = await db.query(CUSTOMER_CASE_SQL, [contactId]);
+    if (!rows[0]) {
+      throw caseError(404, "CUSTOMER_NOT_FOUND", "Customer not found");
+    }
+    const bCase = rows[0];
+    const rowsOf = async (sql) => (await db.query(sql, [bCase.case_id])).rows;
+
+    const packs = (await rowsOf(CUSTOMER_PACKS_SQL)).map((p) => ({
+      ...p,
+      price_at_booking:
+        p.price_at_booking == null ? null : Number(p.price_at_booking),
+    }));
+    const applicants = await rowsOf(CUSTOMER_APPLICANTS_SQL);
+    const documents = await rowsOf(CUSTOMER_DOCUMENTS_SQL);
+
+    return {
+      ...bCase,
+      minimum_deposit_amount:
+        bCase.minimum_deposit_amount == null
+          ? null
+          : Number(bCase.minimum_deposit_amount),
+      packs,
+      // Price of every booked pack; what's left after payments is the balance due.
+      total_price: packs.reduce((sum, p) => sum + (p.price_at_booking ?? 0), 0),
+      applicants,
+      documents,
+    };
+  });
+};
+
+/* ===================== DOCUMENT LINK ===================== */
+
+// How long a document link works, in seconds. Short, because anyone holding
+// the link can open the file.
+const DOCUMENT_LINK_SECONDS = 300;
+
+// Keys as listed by CUSTOMER_DOCUMENTS_SQL.
+const DOCUMENT_KEY_RE = /^(travel-document|attachment)-(\d+)$/;
+
+const isUrl = (value) => /^https?:\/\//i.test(value ?? "");
+
+// Where the file lives: a storage path for travel documents, a ready URL for
+// attachments that have one.
+const findDocumentFile = async (kind, id) =>
+  withClient(async (db) => {
+    if (kind === "travel-document") {
+      const { rows } = await db.query(
+        `select travel_document_file_path as path, first_name, surname
+         from b_contact where contact_id = $1 and discontinued_at is null`,
+        [id],
+      );
+      return rows[0]?.path ? rows[0] : null;
+    }
+    const { rows } = await db.query(
+      `select url_path as path from attachment
+       where attachment_id = $1 and discontinued_at is null`,
+      [id],
+    );
+    return rows[0] ?? null;
+  });
+
+// Get Document Link
+//
+// A short-lived link to view (or, with download, save) one document from the
+// customer page. Travel documents sit in a private storage bucket, so the
+// link is signed; the file is never proxied through this server.
+const getDocumentLinkService = async (
+  documentKey,
+  { download = false } = {},
+) => {
+  const match = DOCUMENT_KEY_RE.exec(String(documentKey ?? ""));
+  if (!match) throw caseError(400, "VALIDATION_ERROR", "Unknown document");
+  const [, kind, id] = match;
+
+  const file = await findDocumentFile(kind, Number(id));
+  if (!file) throw caseError(404, "DOCUMENT_NOT_FOUND", "Document not found");
+  if (isUrl(file.path)) return { url: file.path, expires_in: null };
+  if (kind !== "travel-document" || !file.path) {
+    throw caseError(
+      404,
+      "DOCUMENT_FILE_UNAVAILABLE",
+      "This document's file isn't available to view",
+    );
+  }
+
+  // Saved as e.g. "Emma Carter travel document.pdf" instead of the random
+  // storage name.
+  const ext = file.path.split(".").pop();
+  const fileName = `${[file.first_name, file.surname].filter(Boolean).join(" ") || "Travel"} travel document.${ext}`;
+
+  const { data, error } = await getSupabase()
+    .storage.from(getTravelDocumentsBucket())
+    .createSignedUrl(
+      file.path,
+      DOCUMENT_LINK_SECONDS,
+      download ? { download: fileName } : undefined,
+    );
+  if (error) throw error;
+
+  return { url: data.signedUrl, expires_in: DOCUMENT_LINK_SECONDS };
 };
 
 /* ===================== DATABASE CHECKS ===================== */
@@ -856,14 +1251,17 @@ const toConflictError = (error) => {
 //
 // Called once, on "confirm & submit". All checks run first; then the travel
 // documents are uploaded and every row is written in one transaction, so a
-// failure leaves nothing behind.
+// failure leaves nothing behind. Checks and writes share one connection.
 const createFullCaseService = async (body, files, userId) => {
   const shapeErrors = validateCaseCreation(body, files);
   if (shapeErrors.length > 0) throw validationError(shapeErrors);
 
   const input = toCaseInput(body);
+  return withClient((db) => createFullCase(db, input, files, userId));
+};
+
+const createFullCase = async (db, input, files, userId) => {
   const { lead, applicants, payments } = input;
-  const db = getDb();
   const actor = String(userId);
 
   // ---- Checks (no writes) ----
@@ -908,11 +1306,11 @@ const createFullCaseService = async (body, files, userId) => {
   );
   const documentPaths = await uploadTravelDocuments(orderedFiles);
 
-  let client;
+  // The transaction runs on the connection the checks used.
+  const client = db;
   let created;
 
   try {
-    client = await db.connect();
     await client.query("BEGIN");
 
     const contactRow = (a, i, caseId) => ({
@@ -1130,14 +1528,12 @@ const createFullCaseService = async (body, files, userId) => {
     };
   } catch (error) {
     await client
-      ?.query("ROLLBACK")
+      .query("ROLLBACK")
       .catch((rollbackError) =>
         console.error("Case create rollback failed:", rollbackError),
       );
     await removeTravelDocuments(documentPaths);
     throw toConflictError(error);
-  } finally {
-    client?.release();
   }
 
   // Same follow-up as Submit Initial Deposit: open the info form stage. The
@@ -1184,6 +1580,9 @@ const createFullCaseService = async (body, files, userId) => {
 module.exports = {
   createFullCaseService,
   getMinimumDepositService,
+  listCasesService,
+  getCustomerService,
+  getDocumentLinkService,
   validateCaseCreation,
   decideDeposit,
   detectFileType,

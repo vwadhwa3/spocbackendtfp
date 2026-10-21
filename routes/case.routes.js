@@ -6,6 +6,9 @@ const router = express.Router();
 const { authenticate } = require("../middleware/auth.middleware");
 const { ROLES, requireRole } = require("../middleware/role.middleware");
 const {
+  listCasesController,
+  getCustomerController,
+  getDocumentLinkController,
   getMinimumDepositController,
   createFullCaseController,
 } = require("../controllers/case.controller");
@@ -40,6 +43,15 @@ const parseUpload = (req, res, next) =>
       message: UPLOAD_ERROR_MESSAGES[error.code] ?? error.message,
     });
   });
+
+// List Cases
+router.get("/list", spocOnly, listCasesController);
+
+// Get Customer
+router.get("/customer/:contactId", spocOnly, getCustomerController);
+
+// Get Document Link
+router.get("/document/:documentKey", spocOnly, getDocumentLinkController);
 
 // Get Minimum Deposit
 router.get("/minimum-deposit", spocOnly, getMinimumDepositController);

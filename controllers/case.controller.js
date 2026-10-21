@@ -1,6 +1,9 @@
 const {
   createFullCaseService,
   getMinimumDepositService,
+  listCasesService,
+  getCustomerService,
+  getDocumentLinkService,
 } = require("../services/case.service");
 
 const sendError = (res, error) => {
@@ -46,6 +49,26 @@ const parseData = (req) => {
   throw error;
 };
 
+// List Cases
+const listCasesController = handle(async (req, res) => {
+  const data = await listCasesService();
+  res.json({ success: true, data });
+});
+
+// Get Customer
+const getCustomerController = handle(async (req, res) => {
+  const data = await getCustomerService(req.params.contactId);
+  res.json({ success: true, data });
+});
+
+// Get Document Link
+const getDocumentLinkController = handle(async (req, res) => {
+  const data = await getDocumentLinkService(req.params.documentKey, {
+    download: req.query.download === "1",
+  });
+  res.json({ success: true, data });
+});
+
 // Get Minimum Deposit
 const getMinimumDepositController = handle(async (req, res) => {
   const data = await getMinimumDepositService(req.query);
@@ -63,6 +86,9 @@ const createFullCaseController = handle(async (req, res) => {
 });
 
 module.exports = {
+  listCasesController,
+  getCustomerController,
+  getDocumentLinkController,
   getMinimumDepositController,
   createFullCaseController,
 };
