@@ -611,6 +611,9 @@ const decideDeposit = (totalCents, minimumCents) => {
 // Every open case with the names the SPOC case list and dashboard show, plus
 // each applicant's application status (the dashboard's stages). Read-only.
 // Dates are cast to text so the pg driver doesn't shift them by timezone.
+// Older cases have no destination on b_case; for those it comes from the first
+// applicant's travel info (destination_preferences holds either a country id or,
+// in the legacy shape, the country's name).
 const LIST_CASES_SQL = `
   select c.case_id,
          c.lead_contact_id,
@@ -620,7 +623,7 @@ const LIST_CASES_SQL = `
          (select count(*)::int from b_case_application ca
           where ca.case_id = c.case_id and ca.discontinued_at is null) as applicant_count,
          city.name as application_city,
-         dc.name as destination_country,
+         coalesce(dc.name, pref.destination_country) as destination_country,
          vc.name as visa_category,
          c.tentative_travel_date::text as tentative_travel_date,
          nullif(concat_ws(' ', csr.first_name, csr.last_name), '') as assigned_csr,
@@ -647,6 +650,17 @@ const LIST_CASES_SQL = `
   left join b_contact lc on lc.contact_id = c.lead_contact_id
   left join city on city.city_id = c.application_city_id
   left join country dc on dc.country_id = c.destination_country_id
+  left join lateral (
+    select coalesce(pc.name, ti.destination_preferences->0->>'destinationCountry') as destination_country
+    from b_applications a
+    join application_form f on f.application_id = a.application_id and f.discontinued_at is null
+    join travel_info ti on ti.form_id = f.form_id and ti.discontinued_at is null
+    left join country pc
+      on pc.country_id = (ti.destination_preferences->0->>'destination_country_id')::int
+    where a.case_id = c.case_id and a.discontinued_at is null
+    order by a.application_id
+    limit 1
+  ) pref on c.destination_country_id is null
   left join visa_category vc on vc.visa_category_id = c.visa_category_id
   left join s_user csr on csr.user_id = c.assigned_csr_user_id
   left join s_user tl on tl.user_id = c.assigned_team_lead_user_id
