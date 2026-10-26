@@ -142,6 +142,82 @@ const getCaseStatusId = async (supabase, statusCode) => {
   return row.status_id;
 };
 
+// The status every application on a case takes while the case is in each
+// deposit-step state; the case and its applications always change together.
+const APPLICATION_STATUS_BY_CASE_STATUS = {
+  pending_initial_deposit: "application_pending_initial_deposit",
+  deposit_amount_review: "application_deposit_amount_review",
+  case_created: "created",
+};
+
+const getAppStatusId = async (supabase, statusCode) => {
+  const row = await run(
+    supabase
+      .from("app_status")
+      .select("status_id")
+      .eq("status_code", statusCode)
+      .eq("is_active", 1)
+      .is("discontinued_at", null)
+      .maybeSingle(),
+  );
+  if (!row) throw new Error(`app_status '${statusCode}' is not configured`);
+  return row.status_id;
+};
+
+const findApplications = (supabase, caseId) =>
+  run(
+    supabase
+      .from("b_applications")
+      .select("application_id, status_id")
+      .eq("case_id", caseId)
+      .is("discontinued_at", null),
+  );
+
+// Moves every application found by findApplications to one status.
+const updateApplicationStatuses = async (
+  supabase,
+  applications,
+  statusId,
+  actor,
+) => {
+  if (applications.length === 0) return;
+  await run(
+    supabase
+      .from("b_applications")
+      .update({
+        status_id: statusId,
+        updated_by: actor,
+        updation_timestamp: new Date().toISOString(),
+      })
+      .in(
+        "application_id",
+        applications.map((a) => a.application_id),
+      ),
+  );
+};
+
+// Undo step for updateApplicationStatuses: puts each application back to the
+// status it had before, which may differ between applications.
+const restoreApplicationStatuses = async (supabase, applications) => {
+  const idsByStatus = new Map();
+  for (const { application_id, status_id } of applications) {
+    idsByStatus.set(status_id, [
+      ...(idsByStatus.get(status_id) ?? []),
+      application_id,
+    ]);
+  }
+
+  const results = await Promise.all(
+    [...idsByStatus].map(([status_id, ids]) =>
+      supabase
+        .from("b_applications")
+        .update({ status_id })
+        .in("application_id", ids),
+    ),
+  );
+  return { error: results.find((r) => r.error)?.error ?? null };
+};
+
 const getTaskTypeId = async (supabase, taskTypeCode) => {
   const row = await run(
     supabase
@@ -319,6 +395,12 @@ const submitDepositService = async (caseId, body, userId) => {
     ? "case_created"
     : "deposit_amount_review";
   const nextStatusId = await getCaseStatusId(supabase, nextStatusCode);
+  const nextApplicationStatusCode =
+    APPLICATION_STATUS_BY_CASE_STATUS[nextStatusCode];
+  const [nextApplicationStatusId, applications] = await Promise.all([
+    getAppStatusId(supabase, nextApplicationStatusCode),
+    findApplications(supabase, caseId),
+  ]);
   const depositReviewTaskTypeId = meetsMinimum
     ? null
     : await getTaskTypeId(supabase, "DepositReview");
@@ -358,6 +440,14 @@ const submitDepositService = async (caseId, body, userId) => {
         })
         .eq("case_id", caseId),
     );
+
+    await updateApplicationStatuses(
+      supabase,
+      applications,
+      nextApplicationStatusId,
+      actor,
+    );
+    undo.push(() => restoreApplicationStatuses(supabase, applications));
 
     const createdPayments = await run(
       supabase
@@ -446,6 +536,7 @@ const submitDepositService = async (caseId, body, userId) => {
     return {
       case_id: caseId,
       case_status: nextStatusCode,
+      application_status: nextApplicationStatusCode,
       total_paid: fromCents(totalCents),
       minimum_deposit_amount: fromCents(minimumCents),
       shortfall: fromCents(Math.max(0, minimumCents - totalCents)),
@@ -492,8 +583,9 @@ const validateReview = ({ decision, comments }) => {
 //
 // A Lead Consultant decides a deposit below the minimum. Approve accepts it
 // and moves the case to Case Created; reject sends the case back to Pending
-// Initial Deposit so the SPOC can enter it again. Writes are undone the same
-// way as in Submit Initial Deposit.
+// Initial Deposit so the SPOC can enter it again. Every application on the
+// case follows the case. Writes are undone the same way as in Submit Initial
+// Deposit.
 const reviewDepositService = async (caseId, body, userId) => {
   const errors = validateReview(body);
   if (errors.length > 0) {
@@ -536,9 +628,18 @@ const reviewDepositService = async (caseId, body, userId) => {
   }
 
   const nextStatusCode = approve ? "case_created" : "pending_initial_deposit";
-  const [nextStatusId, depositReviewTaskTypeId] = await Promise.all([
+  const nextApplicationStatusCode =
+    APPLICATION_STATUS_BY_CASE_STATUS[nextStatusCode];
+  const [
+    nextStatusId,
+    depositReviewTaskTypeId,
+    nextApplicationStatusId,
+    applications,
+  ] = await Promise.all([
     getCaseStatusId(supabase, nextStatusCode),
     getTaskTypeId(supabase, "DepositReview"),
+    getAppStatusId(supabase, nextApplicationStatusCode),
+    findApplications(supabase, caseId),
   ]);
   const totalCents = pendingPayments.reduce(
     (sum, p) => sum + toCents(p.amount),
@@ -583,6 +684,14 @@ const reviewDepositService = async (caseId, body, userId) => {
         })
         .eq("case_id", caseId),
     );
+
+    await updateApplicationStatuses(
+      supabase,
+      applications,
+      nextApplicationStatusId,
+      actor,
+    );
+    undo.push(() => restoreApplicationStatuses(supabase, applications));
 
     payments = await run(
       supabase
@@ -633,6 +742,7 @@ const reviewDepositService = async (caseId, body, userId) => {
   return {
     case_id: caseId,
     case_status: nextStatusCode,
+    application_status: nextApplicationStatusCode,
     decision,
     total_paid: approve ? fromCents(totalCents) : 0,
     minimum_deposit_amount: Number(bCase.minimum_deposit_amount),
@@ -649,6 +759,8 @@ module.exports = {
   submitDepositService,
   reviewDepositService,
   startCaseCreated,
+  APPLICATION_STATUS_BY_CASE_STATUS,
+  restoreApplicationStatuses,
   splitEqually,
   validateSubmission,
   validateReview,

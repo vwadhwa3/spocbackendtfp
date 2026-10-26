@@ -4,6 +4,8 @@ const {
   splitEqually,
   validateSubmission,
   validateReview,
+  APPLICATION_STATUS_BY_CASE_STATUS,
+  restoreApplicationStatuses,
 } = require("../services/deposit.service");
 const { ROLES, requireRole } = require("../middleware/role.middleware");
 
@@ -89,6 +91,50 @@ test("review needs approve or reject; comments are optional text", () => {
   assert.deepStrictEqual(reviewFields({ decision: "maybe", comments: 5 }), [
     "decision",
     "comments",
+  ]);
+});
+
+test("applications follow the case through the deposit step", () => {
+  assert.deepStrictEqual(APPLICATION_STATUS_BY_CASE_STATUS, {
+    pending_initial_deposit: "application_pending_initial_deposit",
+    deposit_amount_review: "application_deposit_amount_review",
+    case_created: "created",
+  });
+});
+
+test("undo puts each application back to its own previous status", async () => {
+  const updates = [];
+  const supabase = {
+    from: (table) => ({
+      update: (values) => ({
+        in: async (column, ids) => {
+          updates.push({ table, values, column, ids });
+          return { error: null };
+        },
+      }),
+    }),
+  };
+
+  const result = await restoreApplicationStatuses(supabase, [
+    { application_id: 1, status_id: 35 },
+    { application_id: 2, status_id: 27 },
+    { application_id: 3, status_id: 35 },
+  ]);
+
+  assert.deepStrictEqual(result, { error: null });
+  assert.deepStrictEqual(updates, [
+    {
+      table: "b_applications",
+      values: { status_id: 35 },
+      column: "application_id",
+      ids: [1, 3],
+    },
+    {
+      table: "b_applications",
+      values: { status_id: 27 },
+      column: "application_id",
+      ids: [2],
+    },
   ]);
 });
 

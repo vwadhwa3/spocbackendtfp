@@ -15,6 +15,7 @@ const {
   validateSubmission,
   isValidTimeZone,
   startCaseCreated,
+  APPLICATION_STATUS_BY_CASE_STATUS,
   toCents,
   fromCents,
 } = require("./deposit.service");
@@ -1151,16 +1152,17 @@ const checkReferences = async (db, { lead, applicants, payments }) => {
 // Status, task and transaction type ids the case needs; a missing one is a
 // configuration problem, not a user error.
 const loadConfig = async (db) => {
-  const [caseStatuses, appStatus, transactionType, depositReview] =
+  const [caseStatuses, appStatuses, transactionType, depositReview] =
     await Promise.all([
       db.query(
         `select status_code, status_id, label from case_status
        where status_code = any($1::text[]) and is_active = 1 and discontinued_at is null`,
-        [["pending_initial_deposit", "case_created", "deposit_amount_review"]],
+        [Object.keys(APPLICATION_STATUS_BY_CASE_STATUS)],
       ),
       db.query(
-        `select status_id from app_status
-       where status_code = 'created' and is_active = 1 and discontinued_at is null`,
+        `select status_code, status_id from app_status
+       where status_code = any($1::text[]) and is_active = 1 and discontinued_at is null`,
+        [Object.values(APPLICATION_STATUS_BY_CASE_STATUS)],
       ),
       db.query(
         `select transaction_type_id from transaction_type
@@ -1173,6 +1175,7 @@ const loadConfig = async (db) => {
     ]);
 
   const caseStatus = new Map(caseStatuses.rows.map((r) => [r.status_code, r]));
+  const appStatus = new Map(appStatuses.rows.map((r) => [r.status_code, r]));
   const required = (value, name) => {
     if (value == null) throw new Error(`${name} is not configured`);
     return value;
@@ -1181,10 +1184,11 @@ const loadConfig = async (db) => {
   return {
     caseStatus: (code) =>
       required(caseStatus.get(code), `case_status '${code}'`),
-    applicationCreatedId: required(
-      appStatus.rows[0]?.status_id,
-      "app_status 'created'",
-    ),
+    // The application status that goes with a case status.
+    applicationStatus: (caseStatusCode) => {
+      const code = APPLICATION_STATUS_BY_CASE_STATUS[caseStatusCode];
+      return required(appStatus.get(code), `app_status '${code}'`);
+    },
     initialDepositTypeId: required(
       transactionType.rows[0]?.transaction_type_id,
       "transaction_type 'initial_deposit'",
@@ -1313,6 +1317,10 @@ const createFullCase = async (db, input, files, userId) => {
   );
   const pendingStatus = config.caseStatus("pending_initial_deposit");
   const finalStatus = config.caseStatus(statusCode);
+  const pendingApplicationStatus = config.applicationStatus(
+    "pending_initial_deposit",
+  );
+  const finalApplicationStatus = config.applicationStatus(statusCode);
 
   // ---- Writes ----
   const orderedFiles = applicants.map((_, i) =>
@@ -1414,7 +1422,7 @@ const createFullCase = async (db, input, files, userId) => {
       );
     }
 
-    // 6. One application per applicant.
+    // 6. One application per applicant, waiting for the deposit like the case.
     const applicationIds = [];
     for (const applicantId of contactIds) {
       const row = await insertRow(
@@ -1423,7 +1431,7 @@ const createFullCase = async (db, input, files, userId) => {
         {
           case_id: caseId,
           applicant_id: applicantId,
-          status_id: config.applicationCreatedId,
+          status_id: pendingApplicationStatus.status_id,
           created_by_user_id: userId,
           created_by: actor,
         },
@@ -1505,11 +1513,17 @@ const createFullCase = async (db, input, files, userId) => {
     }
 
     // 9. Deposit decides the status: enough -> Case Created; short -> Deposit
-    //    Amount Review with a task for a Lead Consultant.
+    //    Amount Review with a task for a Lead Consultant. The applications
+    //    follow the case.
     await client.query(
       `update b_case set status_id = $1, initial_deposit_received = $2,
        updated_by = $3, updation_timestamp = now() where case_id = $4`,
       [finalStatus.status_id, fromCents(totalCents), actor, caseId],
+    );
+    await client.query(
+      `update b_applications set status_id = $1, updated_by = $2,
+       updation_timestamp = now() where case_id = $3 and discontinued_at is null`,
+      [finalApplicationStatus.status_id, actor, caseId],
     );
 
     let reviewTask = null;
@@ -1561,6 +1575,7 @@ const createFullCase = async (db, input, files, userId) => {
     case_id: created.caseId,
     status_code: finalStatus.status_code,
     status_label: finalStatus.label,
+    application_status_code: finalApplicationStatus.status_code,
     lead_contact_id: created.contactIds[0],
     lead_full_name: lead.full_name,
     whatsapp_number: lead.whatsapp_number,
