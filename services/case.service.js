@@ -446,7 +446,35 @@ const summarizeQuote = (lines) => {
   };
 };
 
-// Throws 400 when a pack is unknown or inactive.
+// Every applicant books the same packs, so the case pays the per-application
+// quote once per applicant.
+const forApplicants = (quote, applicantCount) => ({
+  ...quote,
+  applicantCount,
+  perApplication: {
+    minimumCents: quote.minimumCents,
+    totalCents: quote.totalCents,
+  },
+  minimumCents: quote.minimumCents * applicantCount,
+  totalCents: quote.totalCents * applicantCount,
+});
+
+// One b_application_service_pack row per application and booked pack, at
+// today's price. Each application carries the full price of its packs.
+const applicationPackRows = (applicationIds, lines, userId, actor) =>
+  applicationIds.flatMap((applicationId) =>
+    lines.map((line) => ({
+      application_id: applicationId,
+      pack_type: line.pack_type,
+      pack_id: line.pack_id,
+      price_at_booking: fromCents(line.priceCents),
+      created_by_user_id: userId,
+      created_by: actor,
+    })),
+  );
+
+// Throws 400 when a pack is unknown or inactive. The quote is for one
+// application; forApplicants scales it to the case.
 const quoteDeposit = async (
   db,
   { destinationCountryId, applicationCountryId, servicePackIds, addOnPackIds },
@@ -512,11 +540,15 @@ const getCurrencyCode = async (db, currencyId) => {
   return rows[0]?.iso_code ?? null;
 };
 
+// Totals are for the whole case; pack prices are per application.
 const formatQuote = (quote, currencyCode) => ({
   currency_id: quote.currency_id,
   currency_code: currencyCode,
+  applicant_count: quote.applicantCount,
   minimum_deposit_amount: fromCents(quote.minimumCents),
   total_price: fromCents(quote.totalCents),
+  per_application_minimum_deposit: fromCents(quote.perApplication.minimumCents),
+  per_application_total_price: fromCents(quote.perApplication.totalCents),
   packs: quote.lines.map((l) => ({
     pack_type: l.pack_type,
     pack_id: l.pack_id,
@@ -555,10 +587,24 @@ const parseId = (value, field) => {
   return Number(value);
 };
 
+// Optional; the wizard sends how many applicants it has so far.
+const parseApplicantCount = (value) => {
+  if (value == null || value === "") return 1;
+  const count = parseId(value, "applicant_count");
+  if (count > MAX_APPLICANTS) {
+    throw caseError(
+      400,
+      "VALIDATION_ERROR",
+      `applicant_count must be at most ${MAX_APPLICANTS}`,
+    );
+  }
+  return count;
+};
+
 // Get Minimum Deposit
 //
 // Step 2 shows this before anything is saved; create-full recalculates it the
-// same way, so the two always agree.
+// same way, so the two agree when applicant_count matches the applicants sent.
 const getMinimumDepositService = async (query) => {
   const destinationCountryId = parseId(
     query.destination_country_id,
@@ -576,6 +622,7 @@ const getMinimumDepositService = async (query) => {
     },
   );
   const addOnPackIds = parseIdList(query.add_on_pack_ids, "add_on_pack_ids");
+  const applicantCount = parseApplicantCount(query.applicant_count);
 
   return withClient(async (db) => {
     const city = await getApplicationCountryId(
@@ -585,12 +632,15 @@ const getMinimumDepositService = async (query) => {
     );
     if (city.error) throw caseError(400, "VALIDATION_ERROR", city.error);
 
-    const quote = await quoteDeposit(db, {
-      destinationCountryId,
-      applicationCountryId: city.countryId,
-      servicePackIds,
-      addOnPackIds,
-    });
+    const quote = forApplicants(
+      await quoteDeposit(db, {
+        destinationCountryId,
+        applicationCountryId: city.countryId,
+        servicePackIds,
+        addOnPackIds,
+      }),
+      applicantCount,
+    );
 
     return formatQuote(quote, await getCurrencyCode(db, quote.currency_id));
   });
@@ -719,6 +769,19 @@ const CUSTOMER_PACKS_SQL = `
   where bp.case_id = $1
   order by bp.pack_type desc, name`;
 
+// What the case costs: every application's packs. Cases created before packs
+// were booked per application paid for the case's packs once.
+const CUSTOMER_TOTAL_PRICE_SQL = `
+  select coalesce(
+    (select sum(ap.price_at_booking)
+     from b_application_service_pack ap
+     join b_applications a on a.application_id = ap.application_id
+     where a.case_id = $1 and a.discontinued_at is null
+       and ap.discontinued_at is null),
+    (select sum(price_at_booking) from b_case_service_pack
+     where case_id = $1 and discontinued_at is null),
+    0) as total_price`;
+
 // One row per applicant: their contact details plus each section of their
 // info form (null until the customer fills it in). Dates are cast to text so
 // the pg driver doesn't shift them by timezone.
@@ -727,6 +790,10 @@ const CUSTOMER_APPLICANTS_SQL = `
          a.vac_account_required,
          a.vac_alias,
          a.vac_password,
+         (select sum(ap.price_at_booking)::float8
+          from b_application_service_pack ap
+          where ap.application_id = a.application_id
+            and ap.discontinued_at is null) as total_price,
          s.label as status_label,
          f.form_id,
          ct.first_name,
@@ -900,6 +967,7 @@ const getCustomerService = async (contactIdParam) => {
       price_at_booking:
         p.price_at_booking == null ? null : Number(p.price_at_booking),
     }));
+    const [{ total_price }] = await rowsOf(CUSTOMER_TOTAL_PRICE_SQL);
     const applicants = await rowsOf(CUSTOMER_APPLICANTS_SQL);
     const documents = await rowsOf(CUSTOMER_DOCUMENTS_SQL);
 
@@ -910,8 +978,9 @@ const getCustomerService = async (contactIdParam) => {
           ? null
           : Number(bCase.minimum_deposit_amount),
       packs,
-      // Price of every booked pack; what's left after payments is the balance due.
-      total_price: packs.reduce((sum, p) => sum + (p.price_at_booking ?? 0), 0),
+      // What's left after payments is the balance due. Packs are listed once,
+      // at their per-application price.
+      total_price: Number(total_price),
       applicants,
       documents,
     };
@@ -1286,12 +1355,15 @@ const createFullCase = async (db, input, files, userId) => {
   const refs = await checkReferences(db, input);
   if (refs.errors.length > 0) throw validationError(refs.errors);
 
-  const quote = await quoteDeposit(db, {
-    destinationCountryId: lead.destination_country_id,
-    applicationCountryId: refs.applicationCountryId,
-    servicePackIds: lead.service_pack_ids,
-    addOnPackIds: lead.add_on_pack_ids,
-  });
+  const quote = forApplicants(
+    await quoteDeposit(db, {
+      destinationCountryId: lead.destination_country_id,
+      applicationCountryId: refs.applicationCountryId,
+      servicePackIds: lead.service_pack_ids,
+      addOnPackIds: lead.add_on_pack_ids,
+    }),
+    applicants.length,
+  );
 
   // Payments are compared with the minimum, so they must share its currency.
   const currencyErrors = payments
@@ -1440,7 +1512,9 @@ const createFullCase = async (db, input, files, userId) => {
       applicationIds.push(Number(row.application_id));
     }
 
-    // 7. Booked packs, at today's price.
+    // 7. Booked packs, at today's price: the SPOC's selection on the case,
+    //    then a copy for each application, which its balance is worked out
+    //    from.
     for (const line of quote.lines) {
       await insertRow(
         client,
@@ -1455,6 +1529,14 @@ const createFullCase = async (db, input, files, userId) => {
         },
         "pack_id",
       );
+    }
+    for (const row of applicationPackRows(
+      applicationIds,
+      quote.lines,
+      userId,
+      actor,
+    )) {
+      await insertRow(client, "b_application_service_pack", row, "pack_id");
     }
 
     // 8. Each payment, plus its ledger entry.
@@ -1618,7 +1700,10 @@ module.exports = {
   normalizePhoneInput,
   toQuoteLine,
   summarizeQuote,
+  forApplicants,
+  applicationPackRows,
   parseIdList,
+  parseApplicantCount,
   travelDocumentField,
   MAX_APPLICANTS,
   MAX_FILE_BYTES,

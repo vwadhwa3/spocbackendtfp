@@ -2,6 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert");
 const {
   splitEqually,
+  splitByPrice,
+  getApplicationPrices,
   validateSubmission,
   validateReview,
   depositDecisionMessage,
@@ -79,6 +81,93 @@ test("splits deposit equally and the shares add up to the total", () => {
     { application_id: "7", allocated_deposit_amount: 33.34 },
     { application_id: "8", allocated_deposit_amount: 33.33 },
     { application_id: "9", allocated_deposit_amount: 33.33 },
+  ]);
+});
+
+test("deposit splits by each application's price and leaves its balance", () => {
+  assert.deepStrictEqual(
+    splitByPrice(20000, [
+      { application_id: 101, priceCents: 17451 },
+      { application_id: 102, priceCents: 17451 },
+    ]),
+    [
+      {
+        application_id: 101,
+        total_price: 174.51,
+        allocated_deposit_amount: 100,
+        balance_amount: 74.51,
+      },
+      {
+        application_id: 102,
+        total_price: 174.51,
+        allocated_deposit_amount: 100,
+        balance_amount: 74.51,
+      },
+    ],
+  );
+
+  const uneven = splitByPrice(10001, [
+    { application_id: 1, priceCents: 20000 },
+    { application_id: 2, priceCents: 10000 },
+  ]);
+  assert.deepStrictEqual(
+    uneven.map((a) => a.allocated_deposit_amount),
+    [66.68, 33.33],
+  );
+  assert.deepStrictEqual(
+    uneven.map((a) => a.balance_amount),
+    [133.32, 66.67],
+  );
+});
+
+// Fake Supabase: each table answers with the rows given for it.
+const fakeSupabase = (tables) => ({
+  from: (table) => {
+    const query = {
+      select: () => query,
+      in: () => query,
+      eq: () => query,
+      is: () => Promise.resolve({ data: tables[table], error: null }),
+    };
+    return query;
+  },
+});
+
+test("application prices come from b_application_service_pack", async () => {
+  const prices = await getApplicationPrices(
+    fakeSupabase({
+      b_application_service_pack: [
+        { application_id: 101, price_at_booking: "149.51" },
+        { application_id: 101, price_at_booking: "25.00" },
+        { application_id: 102, price_at_booking: "149.51" },
+        { application_id: 102, price_at_booking: "25.00" },
+      ],
+    }),
+    50,
+    [101, 102],
+  );
+  assert.deepStrictEqual(prices, [
+    { application_id: 101, priceCents: 17451 },
+    { application_id: 102, priceCents: 17451 },
+  ]);
+});
+
+test("older cases share the case-level packs between applications", async () => {
+  const prices = await getApplicationPrices(
+    fakeSupabase({
+      b_application_service_pack: [],
+      b_case_service_pack: [
+        { price_at_booking: "149.51" },
+        { price_at_booking: "25.00" },
+      ],
+    }),
+    6,
+    [11, 12, 13],
+  );
+  assert.deepStrictEqual(prices, [
+    { application_id: 11, priceCents: 5817 },
+    { application_id: 12, priceCents: 5817 },
+    { application_id: 13, priceCents: 5817 },
   ]);
 });
 

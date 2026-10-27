@@ -7,7 +7,10 @@ const {
   normalizePhoneInput,
   toQuoteLine,
   summarizeQuote,
+  forApplicants,
+  applicationPackRows,
   parseIdList,
+  parseApplicantCount,
   MAX_FILE_BYTES,
 } = require("../services/case.service");
 
@@ -251,6 +254,54 @@ test("minimum is the sum of upfront amounts, in one currency only", () => {
       ]),
     (error) => error.statusCode === 422,
   );
+});
+
+test("each applicant pays for the packs: case minimum and total scale", () => {
+  const quote = forApplicants(
+    summarizeQuote([
+      { currency_id: 1, priceCents: 14951, upfrontCents: 7476 },
+      { currency_id: 1, priceCents: 2500, upfrontCents: 1250 },
+    ]),
+    2,
+  );
+  assert.strictEqual(quote.applicantCount, 2);
+  assert.deepStrictEqual(quote.perApplication, {
+    minimumCents: 8726,
+    totalCents: 17451,
+  });
+  assert.strictEqual(quote.minimumCents, 17452);
+  assert.strictEqual(quote.totalCents, 34902);
+});
+
+test("2 applicants, 1 service pack and 1 add-on: a pack row per application", () => {
+  const lines = [
+    { pack_type: "service", pack_id: 1, priceCents: 14951 },
+    { pack_type: "addon", pack_id: 4, priceCents: 2500 },
+  ];
+  const row = (application_id, pack_type, pack_id, price_at_booking) => ({
+    application_id,
+    pack_type,
+    pack_id,
+    price_at_booking,
+    created_by_user_id: 100005,
+    created_by: "100005",
+  });
+  assert.deepStrictEqual(
+    applicationPackRows([101, 102], lines, 100005, "100005"),
+    [
+      row(101, "service", 1, 149.51),
+      row(101, "addon", 4, 25),
+      row(102, "service", 1, 149.51),
+      row(102, "addon", 4, 25),
+    ],
+  );
+});
+
+test("applicant_count defaults to 1 and is capped", () => {
+  assert.strictEqual(parseApplicantCount(undefined), 1);
+  assert.strictEqual(parseApplicantCount("3"), 3);
+  assert.throws(() => parseApplicantCount("0"));
+  assert.throws(() => parseApplicantCount("11"));
 });
 
 test("id lists accept comma lists or repeated params", () => {

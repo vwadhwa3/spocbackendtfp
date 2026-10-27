@@ -109,17 +109,101 @@ const validateSubmission = ({ timezone, payments, discount }) => {
   return errors;
 };
 
-// Splits total cents equally; leftover cents go to the first applications so
-// the shares always add up to the total.
-const splitEqually = (totalCents, applicationIds) => {
-  const n = applicationIds.length;
+// Splits total cents equally; leftover cents go to the first shares so they
+// always add up to the total.
+const equalShares = (totalCents, n) => {
   const share = Math.floor(totalCents / n);
   const remainder = totalCents - share * n;
+  return Array.from({ length: n }, (_, i) => share + (i < remainder ? 1 : 0));
+};
 
+const splitEqually = (totalCents, applicationIds) => {
+  const shares = equalShares(totalCents, applicationIds.length);
   return applicationIds.map((application_id, i) => ({
     application_id,
-    allocated_deposit_amount: fromCents(share + (i < remainder ? 1 : 0)),
+    allocated_deposit_amount: fromCents(shares[i]),
   }));
+};
+
+// Splits the deposit in proportion to what each application costs, then
+// works out each one's balance. Leftover cents go to the first applications
+// so the shares add up to the total. A negative balance is a credit.
+const splitByPrice = (totalCents, applications) => {
+  const priceCents = applications.reduce((sum, a) => sum + a.priceCents, 0);
+  const shares =
+    priceCents === 0
+      ? equalShares(totalCents, applications.length)
+      : applications.map((a) =>
+          Math.floor((totalCents * a.priceCents) / priceCents),
+        );
+  let remainder = totalCents - shares.reduce((sum, s) => sum + s, 0);
+  for (let i = 0; remainder > 0; i++, remainder--) shares[i] += 1;
+
+  return applications.map((a, i) => ({
+    application_id: a.application_id,
+    total_price: fromCents(a.priceCents),
+    allocated_deposit_amount: fromCents(shares[i]),
+    balance_amount: fromCents(a.priceCents - shares[i]),
+  }));
+};
+
+// What each application costs, in cents, from b_application_service_pack.
+// Cases created before packs were booked per application paid for the case's
+// packs once, shared equally between the applications.
+const getApplicationPrices = async (supabase, caseId, applicationIds) => {
+  const rows = await run(
+    supabase
+      .from("b_application_service_pack")
+      .select("application_id, price_at_booking")
+      .in("application_id", applicationIds)
+      .is("discontinued_at", null),
+  );
+
+  if (rows.length === 0) {
+    const casePacks = await run(
+      supabase
+        .from("b_case_service_pack")
+        .select("price_at_booking")
+        .eq("case_id", caseId)
+        .is("discontinued_at", null),
+    );
+    const shares = equalShares(
+      casePacks.reduce((sum, p) => sum + toCents(p.price_at_booking), 0),
+      applicationIds.length,
+    );
+    return applicationIds.map((application_id, i) => ({
+      application_id,
+      priceCents: shares[i],
+    }));
+  }
+
+  const priceCents = new Map(applicationIds.map((id) => [id, 0]));
+  for (const row of rows) {
+    priceCents.set(
+      row.application_id,
+      priceCents.get(row.application_id) + toCents(row.price_at_booking),
+    );
+  }
+  return applicationIds.map((application_id) => ({
+    application_id,
+    priceCents: priceCents.get(application_id),
+  }));
+};
+
+// The deposit is already saved, so a failure to read prices is logged and
+// the split goes back to equal shares without balances.
+const splitDeposit = async (caseId, totalCents, applicationIds) => {
+  try {
+    const applications = await getApplicationPrices(
+      getSupabase(),
+      caseId,
+      applicationIds,
+    );
+    return splitByPrice(totalCents, applications);
+  } catch (error) {
+    console.error("Application balance failed:", error);
+    return splitEqually(totalCents, applicationIds);
+  }
 };
 
 // Unwraps a Supabase response: throws on error, returns data otherwise.
@@ -304,19 +388,15 @@ const getPaymentsService = async (caseId) => {
   }));
 };
 
-// Runs the Case Created step and splits the deposit across the applications.
-// The deposit is complete by then, so a failure here is reported rather than
-// undoing it; POST /api/cases/:caseId/info-form/start retries.
+// Runs the Case Created step and splits the deposit across the applications,
+// each with the balance left on its packs. The deposit is complete by then,
+// so a failure here is reported rather than undoing it;
+// POST /api/cases/:caseId/info-form/start retries.
 // The split is returned, not stored: b_applications has no column for it.
 const startCaseCreated = async (caseId, totalCents, userId) => {
+  let infoForm;
   try {
-    const infoForm = await startInfoFormStageService(caseId, userId);
-    const ids = [...infoForm.application_ids].sort((a, b) => a - b);
-    return {
-      applications: ids.length ? splitEqually(totalCents, ids) : [],
-      info_form: infoForm,
-      info_form_error: null,
-    };
+    infoForm = await startInfoFormStageService(caseId, userId);
   } catch (error) {
     console.error("Info form stage failed:", error);
     return {
@@ -327,6 +407,13 @@ const startCaseCreated = async (caseId, totalCents, userId) => {
         : "Info form setup failed",
     };
   }
+
+  const ids = [...infoForm.application_ids].sort((a, b) => a - b);
+  return {
+    applications: ids.length ? await splitDeposit(caseId, totalCents, ids) : [],
+    info_form: infoForm,
+    info_form_error: null,
+  };
 };
 
 // Submit Initial Deposit
@@ -796,6 +883,8 @@ module.exports = {
   APPLICATION_STATUS_BY_CASE_STATUS,
   restoreApplicationStatuses,
   splitEqually,
+  splitByPrice,
+  getApplicationPrices,
   validateSubmission,
   validateReview,
   depositDecisionMessage,
