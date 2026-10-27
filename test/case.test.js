@@ -11,6 +11,7 @@ const {
   applicationPackRows,
   parseIdList,
   parseApplicantCount,
+  parseMyCasesQuery,
   MAX_FILE_BYTES,
 } = require("../services/case.service");
 
@@ -310,4 +311,78 @@ test("id lists accept comma lists or repeated params", () => {
   assert.deepStrictEqual(parseIdList(undefined, "ids"), []);
   assert.throws(() => parseIdList(undefined, "ids", { required: true }));
   assert.throws(() => parseIdList("1,x", "ids"));
+});
+
+test("my cases: no filters is page 1 of everything", () => {
+  assert.deepStrictEqual(parseMyCasesQuery({}), {
+    namePattern: null,
+    whatsappDigits: null,
+    status: null,
+    page: 1,
+  });
+  assert.deepStrictEqual(
+    parseMyCasesQuery({ name: " ", whatsapp: "", status: "" }),
+    parseMyCasesQuery({}),
+  );
+});
+
+test("my cases: WhatsApp search matches the exact number, digits only", () => {
+  const { whatsappDigits } = parseMyCasesQuery({
+    whatsapp: "+44 (7900) 000-001",
+  });
+  assert.strictEqual(whatsappDigits, "447900000001");
+  assert.throws(() => parseMyCasesQuery({ whatsapp: "abc" }), {
+    statusCode: 400,
+  });
+});
+
+test("my cases: name search is a partial match with wildcards escaped", () => {
+  assert.strictEqual(
+    parseMyCasesQuery({ name: "  Asha   Patel " }).namePattern,
+    "%Asha Patel%",
+  );
+  assert.strictEqual(
+    parseMyCasesQuery({ name: "50%_off" }).namePattern,
+    "%50\\%\\_off%",
+  );
+  assert.throws(() => parseMyCasesQuery({ name: "x".repeat(201) }), {
+    statusCode: 400,
+  });
+});
+
+test("my cases: status filter takes only the 5 case states", () => {
+  [
+    "pending_initial_deposit",
+    "deposit_amount_review",
+    "case_created",
+    "case_in_progress",
+    "case_completed",
+  ].forEach((status) =>
+    assert.strictEqual(parseMyCasesQuery({ status }).status, status),
+  );
+  assert.throws(() => parseMyCasesQuery({ status: "appointments_pending" }), {
+    statusCode: 400,
+  });
+});
+
+test("my cases: filters combine; page must be a positive integer, sent once", () => {
+  assert.deepStrictEqual(
+    parseMyCasesQuery({
+      name: "Asha",
+      whatsapp: "+447900000001",
+      status: "case_created",
+      page: "2",
+    }),
+    {
+      namePattern: "%Asha%",
+      whatsappDigits: "447900000001",
+      status: "case_created",
+      page: 2,
+    },
+  );
+  assert.throws(() => parseMyCasesQuery({ page: "0" }), { statusCode: 400 });
+  assert.throws(() => parseMyCasesQuery({ page: "x" }), { statusCode: 400 });
+  assert.throws(() => parseMyCasesQuery({ status: ["case_created", "x"] }), {
+    statusCode: 400,
+  });
 });

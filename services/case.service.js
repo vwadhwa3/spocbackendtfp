@@ -723,6 +723,130 @@ const LIST_CASES_SQL = `
 const listCasesService = async () =>
   (await (await getDb()).query(LIST_CASES_SQL)).rows;
 
+/* ===================== MY CASES ===================== */
+
+// The SPOC's own cases list: only cases they created, searchable by the
+// Customer Lead's name, WhatsApp number and case status. Read-only.
+
+const MY_CASES_PAGE_SIZE = 25;
+
+// The 5 approved case states the status filter accepts. case_status has
+// older steps too (case_info_for_review ... case_payment_completed) that
+// case_in_progress replaced.
+const MY_CASES_STATUS_CODES = [
+  "pending_initial_deposit",
+  "deposit_amount_review",
+  "case_created",
+  "case_in_progress",
+  "case_completed",
+];
+
+// Escapes LIKE wildcards so a name with % or _ matches literally.
+const escapeLike = (value) => value.replace(/[\\%_]/g, "\\$&");
+
+// Turns the query string into SQL parameters; throws 400 on bad input.
+// Express gives an array when a param is repeated, so only strings pass.
+const parseMyCasesQuery = (query = {}) => {
+  const text = (key) => {
+    const value = query[key];
+    if (value == null) return null;
+    if (typeof value !== "string") {
+      throw caseError(400, "VALIDATION_ERROR", `${key} must be sent once`);
+    }
+    return t(value);
+  };
+
+  const name = text("name")?.replace(/\s+/g, " ") ?? null;
+  if (name && name.length > FULL_NAME_MAX_LENGTH) {
+    throw caseError(
+      400,
+      "VALIDATION_ERROR",
+      `name must be at most ${FULL_NAME_MAX_LENGTH} characters`,
+    );
+  }
+
+  // The WhatsApp number identifies a case (BR1), so it is matched exactly,
+  // digits only: "+44 7900 000001" finds "+447900000001".
+  const whatsapp = text("whatsapp");
+  const whatsappDigits = whatsapp ? whatsapp.replace(/\D/g, "") : null;
+  if (whatsapp && !whatsappDigits) {
+    throw caseError(
+      400,
+      "VALIDATION_ERROR",
+      "whatsapp must be a phone number, e.g. +447900000000",
+    );
+  }
+
+  const status = text("status");
+  if (status && !MY_CASES_STATUS_CODES.includes(status)) {
+    throw caseError(
+      400,
+      "VALIDATION_ERROR",
+      `status must be one of ${MY_CASES_STATUS_CODES.join(", ")}`,
+    );
+  }
+
+  const pageText = text("page");
+  const page = pageText == null ? 1 : parseId(pageText, "page");
+
+  return {
+    namePattern: name ? `%${escapeLike(name)}%` : null,
+    whatsappDigits,
+    status,
+    page,
+  };
+};
+
+// $1 is the SPOC's user id; b_case.created_by holds it as text.
+const MY_CASES_FROM_SQL = `
+  from b_case c
+  left join b_contact lc on lc.contact_id = c.lead_contact_id
+  left join case_status cs on cs.status_id = c.status_id
+  where c.discontinued_at is null
+    and c.created_by = $1
+    and ($2::text is null or concat_ws(' ', lc.first_name, lc.surname) ilike $2)
+    and ($3::text is null or regexp_replace(lc.whatsapp_number, '\\D', '', 'g') = $3)
+    and ($4::text is null or cs.status_code = $4)`;
+
+const MY_CASES_SQL = `
+  select c.case_id,
+         c.lead_contact_id,
+         nullif(concat_ws(' ', lc.first_name, lc.surname), '') as lead_name,
+         lc.whatsapp_number as lead_whatsapp_number,
+         cs.status_code,
+         cs.label as status_label,
+         c.creation_timestamp as created_at
+  ${MY_CASES_FROM_SQL}
+  order by c.creation_timestamp desc, c.case_id desc
+  limit ${MY_CASES_PAGE_SIZE} offset $5`;
+
+const MY_CASES_COUNT_SQL = `select count(*)::int as total ${MY_CASES_FROM_SQL}`;
+
+// List My Cases
+const listMyCasesService = async (query, userId) => {
+  const { namePattern, whatsappDigits, status, page } =
+    parseMyCasesQuery(query);
+  const filters = [String(userId), namePattern, whatsappDigits, status];
+
+  return withClient(async (db) => {
+    const { rows } = await db.query(MY_CASES_SQL, [
+      ...filters,
+      (page - 1) * MY_CASES_PAGE_SIZE,
+    ]);
+    const [{ total }] = (await db.query(MY_CASES_COUNT_SQL, filters)).rows;
+
+    return {
+      cases: rows,
+      pagination: {
+        page,
+        page_size: MY_CASES_PAGE_SIZE,
+        total,
+        total_pages: Math.ceil(total / MY_CASES_PAGE_SIZE),
+      },
+    };
+  });
+};
+
 /* ===================== CUSTOMER DETAIL ===================== */
 
 // The Directory's customer page: the case a customer lead belongs to, its
@@ -1692,9 +1816,12 @@ module.exports = {
   createFullCaseService,
   getMinimumDepositService,
   listCasesService,
+  listMyCasesService,
   getCustomerService,
   getDocumentLinkService,
   validateCaseCreation,
+  parseMyCasesQuery,
+  MY_CASES_STATUS_CODES,
   decideDeposit,
   detectFileType,
   normalizePhoneInput,

@@ -2,6 +2,7 @@ const {
   createFullCaseService,
   getMinimumDepositService,
   listCasesService,
+  listMyCasesService,
   getCustomerService,
   getDocumentLinkService,
 } = require("../services/case.service");
@@ -55,6 +56,16 @@ const listCasesController = handle(async (req, res) => {
   res.json({ success: true, data });
 });
 
+// List My Cases
+const listMyCasesController = handle(async (req, res) => {
+  const data = await listMyCasesService(req.query, req.user.userId);
+  res.json({
+    success: true,
+    ...(data.pagination.total === 0 && { message: "No cases found" }),
+    data,
+  });
+});
+
 // Get Customer
 const getCustomerController = handle(async (req, res) => {
   const data = await getCustomerService(req.params.contactId);
@@ -87,6 +98,7 @@ const createFullCaseController = handle(async (req, res) => {
 
 module.exports = {
   listCasesController,
+  listMyCasesController,
   getCustomerController,
   getDocumentLinkController,
   getMinimumDepositController,

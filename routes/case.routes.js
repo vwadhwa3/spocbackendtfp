@@ -7,6 +7,7 @@ const { authenticate } = require("../middleware/auth.middleware");
 const { ROLES, requireRole } = require("../middleware/role.middleware");
 const {
   listCasesController,
+  listMyCasesController,
   getCustomerController,
   getDocumentLinkController,
   getMinimumDepositController,
@@ -46,6 +47,9 @@ const parseUpload = (req, res, next) =>
 
 // List Cases
 router.get("/list", spocOnly, listCasesController);
+
+// List My Cases: ?name=&whatsapp=&status=&page=
+router.get("/my-cases", spocOnly, listMyCasesController);
 
 // Get Customer
 router.get("/customer/:contactId", spocOnly, getCustomerController);
