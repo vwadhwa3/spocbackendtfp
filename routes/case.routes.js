@@ -8,6 +8,7 @@ const { ROLES, requireRole } = require("../middleware/role.middleware");
 const {
   listCasesController,
   listMyCasesController,
+  getMyCaseController,
   getCustomerController,
   getDocumentLinkController,
   getMinimumDepositController,
@@ -50,6 +51,9 @@ router.get("/list", spocOnly, listCasesController);
 
 // List My Cases: ?name=&whatsapp=&status=&page=
 router.get("/my-cases", spocOnly, listMyCasesController);
+
+// Get My Case: one of the SPOC's own cases, read-only
+router.get("/my-cases/:caseId", spocOnly, getMyCaseController);
 
 // Get Customer
 router.get("/customer/:contactId", spocOnly, getCustomerController);

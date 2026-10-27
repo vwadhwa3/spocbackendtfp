@@ -12,6 +12,9 @@ const {
   parseIdList,
   parseApplicantCount,
   parseMyCasesQuery,
+  depositReview,
+  summarizeDeposit,
+  groupPacks,
   MAX_FILE_BYTES,
 } = require("../services/case.service");
 
@@ -385,4 +388,101 @@ test("my cases: filters combine; page must be a positive integer, sent once", ()
   assert.throws(() => parseMyCasesQuery({ status: ["case_created", "x"] }), {
     statusCode: 400,
   });
+});
+
+test("my case: Deposit Amount Review waits for the Lead Consultant", () => {
+  assert.deepStrictEqual(depositReview("deposit_amount_review", null), {
+    review_status: "pending",
+    message: "Waiting for Lead Consultant approval",
+  });
+});
+
+test("my case: a rejected deposit is Pending Initial Deposit again, with a message", () => {
+  assert.deepStrictEqual(depositReview("pending_initial_deposit", "reject"), {
+    review_status: "rejected",
+    message:
+      "Deposit rejected by Lead Consultant. Please enter the payment again.",
+  });
+});
+
+test("my case: no deposit message when nothing is under review", () => {
+  const none = { review_status: null, message: null };
+  // Never entered yet, so never reviewed.
+  assert.deepStrictEqual(depositReview("pending_initial_deposit", null), none);
+  // Approved, or a rejection followed by an accepted deposit.
+  assert.deepStrictEqual(depositReview("case_created", "approve"), none);
+  assert.deepStrictEqual(depositReview("case_in_progress", "reject"), none);
+});
+
+const payment = (amount, overrides = {}) => ({
+  type: "initial_deposit",
+  status: "approved",
+  amount,
+  ...overrides,
+});
+
+test("my case: deposit is shared equally across applications (BR5)", () => {
+  const deposit = summarizeDeposit(
+    "100.00",
+    [payment(60), payment(40.01)],
+    ["11", "12", "13"],
+  );
+  assert.deepStrictEqual(deposit, {
+    minimum_deposit_amount: 100,
+    amount_paid: 100.01,
+    total_paid: 100.01,
+    shortfall: 0,
+    shares: [
+      { application_id: "11", allocated_deposit_amount: 33.34 },
+      { application_id: "12", allocated_deposit_amount: 33.34 },
+      { application_id: "13", allocated_deposit_amount: 33.33 },
+    ],
+  });
+});
+
+test("my case: rejected payments don't count; pending ones do", () => {
+  const deposit = summarizeDeposit(
+    "100.00",
+    [
+      payment(30, { status: "rejected" }),
+      payment(40, { status: "pending" }),
+      payment(25, { type: "balance_payment" }),
+    ],
+    ["11"],
+  );
+  assert.strictEqual(deposit.amount_paid, 40);
+  assert.strictEqual(deposit.total_paid, 65);
+  assert.strictEqual(deposit.shortfall, 60);
+  assert.deepStrictEqual(deposit.shares, [
+    { application_id: "11", allocated_deposit_amount: 40 },
+  ]);
+});
+
+test("my case: no payments, no applications, no minimum", () => {
+  assert.deepStrictEqual(summarizeDeposit(null, [], []), {
+    minimum_deposit_amount: null,
+    amount_paid: 0,
+    total_paid: 0,
+    shortfall: null,
+    shares: [],
+  });
+});
+
+test("my case: packs split into service packs and add-ons", () => {
+  assert.deepStrictEqual(
+    groupPacks([
+      {
+        application_id: "74",
+        pack_type: "service",
+        pack_id: 1,
+        name: "Standard",
+      },
+      { application_id: "74", pack_type: "addon", pack_id: 4, name: "Courier" },
+    ]),
+    {
+      service_packs: [{ pack_id: 1, name: "Standard" }],
+      add_ons: [{ pack_id: 4, name: "Courier" }],
+    },
+  );
+  assert.deepStrictEqual(groupPacks([]), { service_packs: [], add_ons: [] });
 });

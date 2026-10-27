@@ -3,6 +3,7 @@ const {
   getMinimumDepositService,
   listCasesService,
   listMyCasesService,
+  getMyCaseService,
   getCustomerService,
   getDocumentLinkService,
 } = require("../services/case.service");
@@ -66,6 +67,12 @@ const listMyCasesController = handle(async (req, res) => {
   });
 });
 
+// Get My Case
+const getMyCaseController = handle(async (req, res) => {
+  const data = await getMyCaseService(req.params.caseId, req.user.userId);
+  res.json({ success: true, data });
+});
+
 // Get Customer
 const getCustomerController = handle(async (req, res) => {
   const data = await getCustomerService(req.params.contactId);
@@ -99,6 +106,7 @@ const createFullCaseController = handle(async (req, res) => {
 module.exports = {
   listCasesController,
   listMyCasesController,
+  getMyCaseController,
   getCustomerController,
   getDocumentLinkController,
   getMinimumDepositController,

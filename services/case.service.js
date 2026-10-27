@@ -16,6 +16,7 @@ const {
   isValidTimeZone,
   startCaseCreated,
   APPLICATION_STATUS_BY_CASE_STATUS,
+  splitEqually,
   toCents,
   fromCents,
 } = require("./deposit.service");
@@ -659,12 +660,26 @@ const decideDeposit = (totalCents, minimumCents) => {
 
 /* ===================== LIST ===================== */
 
+// Older cases have no destination on b_case; for those it comes from the first
+// applicant's travel info (destination_preferences holds either a country id or,
+// in the legacy shape, the country's name). Needs b_case aliased as c and
+// country as dc; select coalesce(dc.name, pref.destination_country).
+const LEGACY_DESTINATION_JOIN = `
+  left join lateral (
+    select coalesce(pc.name, ti.destination_preferences->0->>'destinationCountry') as destination_country
+    from b_applications a
+    join application_form f on f.application_id = a.application_id and f.discontinued_at is null
+    join travel_info ti on ti.form_id = f.form_id and ti.discontinued_at is null
+    left join country pc
+      on pc.country_id = (ti.destination_preferences->0->>'destination_country_id')::int
+    where a.case_id = c.case_id and a.discontinued_at is null
+    order by a.application_id
+    limit 1
+  ) pref on c.destination_country_id is null`;
+
 // Every open case with the names the SPOC case list and dashboard show, plus
 // each applicant's application status (the dashboard's stages). Read-only.
 // Dates are cast to text so the pg driver doesn't shift them by timezone.
-// Older cases have no destination on b_case; for those it comes from the first
-// applicant's travel info (destination_preferences holds either a country id or,
-// in the legacy shape, the country's name).
 const LIST_CASES_SQL = `
   select c.case_id,
          c.lead_contact_id,
@@ -701,17 +716,7 @@ const LIST_CASES_SQL = `
   left join b_contact lc on lc.contact_id = c.lead_contact_id
   left join city on city.city_id = c.application_city_id
   left join country dc on dc.country_id = c.destination_country_id
-  left join lateral (
-    select coalesce(pc.name, ti.destination_preferences->0->>'destinationCountry') as destination_country
-    from b_applications a
-    join application_form f on f.application_id = a.application_id and f.discontinued_at is null
-    join travel_info ti on ti.form_id = f.form_id and ti.discontinued_at is null
-    left join country pc
-      on pc.country_id = (ti.destination_preferences->0->>'destination_country_id')::int
-    where a.case_id = c.case_id and a.discontinued_at is null
-    order by a.application_id
-    limit 1
-  ) pref on c.destination_country_id is null
+  ${LEGACY_DESTINATION_JOIN}
   left join visa_category vc on vc.visa_category_id = c.visa_category_id
   left join s_user csr on csr.user_id = c.assigned_csr_user_id
   left join s_user tl on tl.user_id = c.assigned_team_lead_user_id
@@ -842,6 +847,212 @@ const listMyCasesService = async (query, userId) => {
         page_size: MY_CASES_PAGE_SIZE,
         total,
         total_pages: Math.ceil(total / MY_CASES_PAGE_SIZE),
+      },
+    };
+  });
+};
+
+/* ===================== MY CASE DETAIL ===================== */
+
+// One of the SPOC's own cases, opened from My Cases: the case, its
+// applications and its deposit, so the SPOC can answer the customer without
+// asking the team. Read-only.
+
+const DEPOSIT_REVIEW_MESSAGE = "Waiting for Lead Consultant approval";
+const DEPOSIT_REJECTED_MESSAGE =
+  "Deposit rejected by Lead Consultant. Please enter the payment again.";
+
+// $2 is the SPOC's user id; b_case.created_by holds it as text. Someone else's
+// case is not found, the same as one that doesn't exist. The latest
+// DepositReview decision tells a rejected deposit apart from one never entered.
+const MY_CASE_SQL = `
+  select c.case_id,
+         c.lead_contact_id,
+         nullif(concat_ws(' ', lc.first_name, lc.surname), '') as lead_name,
+         lc.whatsapp_number as lead_whatsapp_number,
+         coalesce(dc.name, pref.destination_country) as destination_country,
+         city.name as application_city,
+         c.tentative_travel_date::text as tentative_travel_date,
+         vc.name as visa_category,
+         nullif(concat_ws(' ', csr.first_name, csr.last_name), '') as assigned_csr,
+         nullif(concat_ws(' ', tl.first_name, tl.last_name), '') as assigned_team_lead,
+         cs.status_code,
+         cs.label as status_label,
+         c.minimum_deposit_amount,
+         cur.iso_code as currency_code,
+         (select t.decision
+          from task t
+          join s_task st on st.task_type_id = t.task_type_id
+          where t.case_id = c.case_id and st.task_type_code = 'DepositReview'
+            and t.discontinued_at is null
+          order by t.task_id desc
+          limit 1) as last_deposit_decision
+  from b_case c
+  left join b_contact lc on lc.contact_id = c.lead_contact_id
+  left join city on city.city_id = c.application_city_id
+  left join country dc on dc.country_id = c.destination_country_id
+  ${LEGACY_DESTINATION_JOIN}
+  left join visa_category vc on vc.visa_category_id = c.visa_category_id
+  left join s_user csr on csr.user_id = c.assigned_csr_user_id
+  left join s_user tl on tl.user_id = c.assigned_team_lead_user_id
+  left join case_status cs on cs.status_id = c.status_id
+  left join currency cur on cur.currency_id = c.currency_id
+  where c.case_id = $1 and c.created_by = $2 and c.discontinued_at is null`;
+
+const MY_CASE_APPLICATIONS_SQL = `
+  select a.application_id,
+         nullif(concat_ws(' ', ac.first_name, ac.surname), '') as applicant_name,
+         ca.relationship_to_lead,
+         s.status_code,
+         s.label as status_label,
+         s.is_terminal
+  from b_applications a
+  left join b_contact ac on ac.contact_id = a.applicant_id
+  left join app_status s on s.status_id = a.status_id
+  left join b_case_application ca
+    on ca.case_id = a.case_id and ca.applicant_id = a.applicant_id
+   and ca.discontinued_at is null
+  where a.case_id = $1 and a.discontinued_at is null
+  order by ca.sequence_number nulls last, a.application_id`;
+
+// Packs booked on each application, services first.
+const MY_CASE_APPLICATION_PACKS_SQL = `
+  select ap.application_id, ap.pack_type, ap.pack_id,
+         coalesce(sp.name, ao.name) as name
+  from b_application_service_pack ap
+  join b_applications a on a.application_id = ap.application_id
+  left join service_pack sp
+    on ap.pack_type = 'service' and sp.service_pack_id = ap.pack_id
+  left join add_on_pack ao
+    on ap.pack_type = 'addon' and ao.add_on_pack_id = ap.pack_id
+  where a.case_id = $1 and a.discontinued_at is null
+    and ap.discontinued_at is null
+  order by ap.application_id, ap.pack_type desc, name`;
+
+// Cases created before packs were booked per application have only the case's
+// packs, which every applicant shares.
+const MY_CASE_PACKS_SQL = `
+  select bp.pack_type, bp.pack_id, coalesce(sp.name, ao.name) as name
+  from b_case_service_pack bp
+  left join service_pack sp
+    on bp.pack_type = 'service' and sp.service_pack_id = bp.pack_id
+  left join add_on_pack ao
+    on bp.pack_type = 'addon' and ao.add_on_pack_id = bp.pack_id
+  where bp.case_id = $1 and bp.discontinued_at is null
+  order by bp.pack_type desc, name`;
+
+// The local time is formatted in SQL so the pg driver doesn't shift it by
+// timezone; it reads as the SPOC typed it.
+const MY_CASE_PAYMENTS_SQL = `
+  select p.payment_id,
+         p.type,
+         p.amount,
+         p.status,
+         p.payment_reference,
+         to_char(p.local_payment_datetime, 'YYYY-MM-DD"T"HH24:MI:SS') as local_payment_datetime,
+         p.payment_timestamp_utc,
+         p.bank_account_id,
+         b.account_name as bank_account_name
+  from payment p
+  left join bank_account b on b.bank_account_id = p.bank_account_id
+  where p.case_id = $1 and p.discontinued_at is null
+  order by p.payment_timestamp_utc, p.payment_id`;
+
+// What the SPOC tells the customer while the deposit isn't settled: a
+// shortfall waiting for a Lead Consultant, or one they rejected, which puts
+// the case back in Pending Initial Deposit. Null otherwise.
+const depositReview = (statusCode, lastDecision) => {
+  if (statusCode === "deposit_amount_review") {
+    return { review_status: "pending", message: DEPOSIT_REVIEW_MESSAGE };
+  }
+  if (statusCode === "pending_initial_deposit" && lastDecision === "reject") {
+    return { review_status: "rejected", message: DEPOSIT_REJECTED_MESSAGE };
+  }
+  return { review_status: null, message: null };
+};
+
+// Money received so far, in the case currency. A rejected payment no longer
+// counts; one still pending review does, as on b_case.initial_deposit_received.
+// The deposit is shared equally across the applications (BR5).
+const summarizeDeposit = (minimumDeposit, payments, applicationIds) => {
+  const counted = payments.filter((p) => p.status !== "rejected");
+  const sumCents = (list) =>
+    list.reduce((sum, p) => sum + toCents(p.amount), 0);
+  const depositCents = sumCents(
+    counted.filter((p) => p.type === "initial_deposit"),
+  );
+  const minimumCents = minimumDeposit == null ? null : toCents(minimumDeposit);
+
+  return {
+    minimum_deposit_amount:
+      minimumCents == null ? null : fromCents(minimumCents),
+    amount_paid: fromCents(depositCents),
+    total_paid: fromCents(sumCents(counted)),
+    shortfall:
+      minimumCents == null
+        ? null
+        : fromCents(Math.max(0, minimumCents - depositCents)),
+    shares: applicationIds.length
+      ? splitEqually(depositCents, applicationIds)
+      : [],
+  };
+};
+
+// { service_packs, add_ons } for one application.
+const groupPacks = (packs) => {
+  const list = (type) =>
+    packs
+      .filter((p) => p.pack_type === type)
+      .map(({ pack_id, name }) => ({ pack_id, name }));
+  return { service_packs: list("service"), add_ons: list("addon") };
+};
+
+// Get My Case
+const getMyCaseService = async (caseIdParam, userId) => {
+  const caseId = parseId(caseIdParam, "caseId");
+
+  return withClient(async (db) => {
+    const { rows } = await db.query(MY_CASE_SQL, [caseId, String(userId)]);
+    if (!rows[0]) throw caseError(404, "CASE_NOT_FOUND", "Case not found");
+    const { minimum_deposit_amount, last_deposit_decision, ...bCase } = rows[0];
+    const rowsOf = async (sql) => (await db.query(sql, [caseId])).rows;
+
+    const applications = await rowsOf(MY_CASE_APPLICATIONS_SQL);
+    const applicationPacks = await rowsOf(MY_CASE_APPLICATION_PACKS_SQL);
+    const casePacks =
+      applicationPacks.length === 0 ? await rowsOf(MY_CASE_PACKS_SQL) : [];
+    const payments = (await rowsOf(MY_CASE_PAYMENTS_SQL)).map((p) => ({
+      ...p,
+      amount: Number(p.amount),
+    }));
+
+    const { shares, ...deposit } = summarizeDeposit(
+      minimum_deposit_amount,
+      payments,
+      applications.map((a) => a.application_id),
+    );
+    const shareOf = new Map(
+      shares.map((s) => [s.application_id, s.allocated_deposit_amount]),
+    );
+
+    return {
+      ...bCase,
+      applications: applications.map((a) => ({
+        ...a,
+        ...groupPacks(
+          applicationPacks.length === 0
+            ? casePacks
+            : applicationPacks.filter(
+                (p) => p.application_id === a.application_id,
+              ),
+        ),
+        deposit_share: shareOf.get(a.application_id) ?? 0,
+      })),
+      deposit: {
+        currency_code: bCase.currency_code,
+        ...deposit,
+        ...depositReview(bCase.status_code, last_deposit_decision),
+        payments,
       },
     };
   });
@@ -1817,11 +2028,15 @@ module.exports = {
   getMinimumDepositService,
   listCasesService,
   listMyCasesService,
+  getMyCaseService,
   getCustomerService,
   getDocumentLinkService,
   validateCaseCreation,
   parseMyCasesQuery,
   MY_CASES_STATUS_CODES,
+  depositReview,
+  summarizeDeposit,
+  groupPacks,
   decideDeposit,
   detectFileType,
   normalizePhoneInput,
