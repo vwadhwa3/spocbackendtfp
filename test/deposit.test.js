@@ -4,6 +4,7 @@ const {
   splitEqually,
   validateSubmission,
   validateReview,
+  depositDecisionMessage,
   APPLICATION_STATUS_BY_CASE_STATUS,
   restoreApplicationStatuses,
 } = require("../services/deposit.service");
@@ -160,4 +161,15 @@ test("requireRole only lets the allowed role through", () => {
   ]) {
     assert.strictEqual(run(role), 403);
   }
+});
+
+test("deposit decision message names the Customer Lead", () => {
+  assert.strictEqual(
+    depositDecisionMessage(true, "Asha Rao"),
+    "Deposit approved for Asha Rao.",
+  );
+  assert.strictEqual(
+    depositDecisionMessage(false, "Asha Rao"),
+    "Deposit rejected for Asha Rao. Please enter the payment again.",
+  );
 });

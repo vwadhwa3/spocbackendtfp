@@ -1,6 +1,7 @@
 const { fromZonedTime } = require("date-fns-tz");
 const { getSupabase } = require("../config/database");
 const { startInfoFormStageService } = require("./infoForm.service");
+const { withTransaction } = require("../utils/db.util");
 
 const AMOUNT_RE = /^\d+(\.\d{1,2})?$/;
 // Wall-clock time as the SPOC sees it, no offset: 2026-09-30T14:05 or 2026-09-30T14:05:00
@@ -579,164 +580,196 @@ const validateReview = ({ decision, comments }) => {
   return errors;
 };
 
+// State Machine notification N1: the SPOC hears how a shortfall was decided.
+const DEPOSIT_DECISION_NOTIFICATION_CODE = "N1";
+
+const depositDecisionMessage = (approve, leadName) =>
+  approve
+    ? `Deposit approved for ${leadName}.`
+    : `Deposit rejected for ${leadName}. Please enter the payment again.`;
+
+// b_case has no creator user column, only created_by (String(userId) for
+// cases made through the SPOC wizard). The join leaves spoc_user_id null for
+// cases created by seeds or scripts, which then have no SPOC to notify.
+const REVIEW_CASE_SQL = `
+  select c.case_id, c.status_id, c.minimum_deposit_amount,
+         cs.status_code,
+         lc.first_name as lead_first_name, lc.surname as lead_surname,
+         u.user_id as spoc_user_id
+  from b_case c
+  join case_status cs on cs.status_id = c.status_id
+  left join b_contact lc on lc.contact_id = c.lead_contact_id
+  left join s_user u on u.user_id::text = c.created_by
+  where c.case_id = $1 and c.discontinued_at is null
+  for update of c`;
+
+const lookupId = async (db, sql, code, name) => {
+  const { rows } = await db.query(sql, [code]);
+  if (!rows[0]) throw new Error(`${name} '${code}' is not configured`);
+  return rows[0].id;
+};
+
+const CASE_STATUS_ID_SQL = `select status_id as id from case_status
+  where status_code = $1 and is_active = 1 and discontinued_at is null`;
+const APP_STATUS_ID_SQL = `select status_id as id from app_status
+  where status_code = $1 and is_active = 1 and discontinued_at is null`;
+const TASK_TYPE_ID_SQL = `select task_type_id as id from s_task
+  where task_type_code = $1 and is_active = 1 and discontinued_at is null`;
+
 // Review Deposit Shortfall
 //
 // A Lead Consultant decides a deposit below the minimum. Approve accepts it
 // and moves the case to Case Created; reject sends the case back to Pending
 // Initial Deposit so the SPOC can enter it again. Every application on the
-// case follows the case. Writes are undone the same way as in Submit Initial
-// Deposit.
+// case follows the case, and the SPOC who created the case is notified. All
+// of it is one transaction: if any write fails, nothing is saved, including
+// the notification.
 const reviewDepositService = async (caseId, body, userId) => {
   const errors = validateReview(body);
   if (errors.length > 0) {
     throw depositError(400, "VALIDATION_ERROR", errors[0].message, errors);
   }
 
-  const supabase = getSupabase();
   const { decision } = body;
   const approve = decision === "approve";
   const comments = body.comments?.trim() || null;
   const actor = String(userId);
-  const now = () => new Date().toISOString();
-
-  // ---- Checks (no writes) ----
-  const bCase = await findCase(supabase, caseId);
-
-  if (bCase.case_status.status_code !== "deposit_amount_review") {
-    throw depositError(
-      409,
-      "INVALID_CASE_STATUS",
-      "Case is not in Deposit Amount Review status",
-    );
-  }
-
-  const pendingPayments = await run(
-    supabase
-      .from("payment")
-      .select("payment_id, amount")
-      .eq("case_id", caseId)
-      .eq("type", "initial_deposit")
-      .eq("status", "pending")
-      .is("discontinued_at", null),
-  );
-  if (pendingPayments.length === 0) {
-    throw depositError(
-      409,
-      "NO_PENDING_DEPOSIT",
-      "Case has no pending deposit to review",
-    );
-  }
-
   const nextStatusCode = approve ? "case_created" : "pending_initial_deposit";
   const nextApplicationStatusCode =
     APPLICATION_STATUS_BY_CASE_STATUS[nextStatusCode];
-  const [
-    nextStatusId,
-    depositReviewTaskTypeId,
-    nextApplicationStatusId,
-    applications,
-  ] = await Promise.all([
-    getCaseStatusId(supabase, nextStatusCode),
-    getTaskTypeId(supabase, "DepositReview"),
-    getAppStatusId(supabase, nextApplicationStatusCode),
-    findApplications(supabase, caseId),
-  ]);
-  const totalCents = pendingPayments.reduce(
-    (sum, p) => sum + toCents(p.amount),
-    0,
-  );
-  const paymentIds = pendingPayments.map((p) => p.payment_id);
 
-  // ---- Writes ----
-  const undo = [];
-  let payments;
-  let reviewTasks;
+  const reviewed = await withTransaction(async (db) => {
+    // ---- Checks (no writes) ----
+    // The row lock keeps a second reviewer waiting until this one finishes,
+    // after which it sees the new status and is turned away.
+    const bCase = (await db.query(REVIEW_CASE_SQL, [caseId])).rows[0];
+    if (!bCase) throw depositError(404, "CASE_NOT_FOUND", "Case not found");
 
-  try {
-    // Same claim as on submit, so two reviewers can't both decide.
-    const claimed = await run(
-      supabase
-        .from("b_case")
-        .update({
-          status_id: nextStatusId,
-          // A rejected deposit no longer counts as received.
-          initial_deposit_received: approve ? fromCents(totalCents) : 0,
-          updated_by: actor,
-          updation_timestamp: now(),
-        })
-        .eq("case_id", caseId)
-        .eq("status_id", bCase.status_id)
-        .select("case_id"),
-    );
-    if (claimed.length === 0) {
+    if (bCase.status_code !== "deposit_amount_review") {
       throw depositError(
         409,
         "INVALID_CASE_STATUS",
         "Case is not in Deposit Amount Review status",
       );
     }
-    undo.push(() =>
-      supabase
-        .from("b_case")
-        .update({
-          status_id: bCase.status_id,
-          initial_deposit_received: bCase.initial_deposit_received,
-        })
-        .eq("case_id", caseId),
-    );
 
-    await updateApplicationStatuses(
-      supabase,
-      applications,
-      nextApplicationStatusId,
-      actor,
+    const { rows: pendingPayments } = await db.query(
+      `select payment_id, amount from payment
+       where case_id = $1 and type = 'initial_deposit' and status = 'pending'
+         and discontinued_at is null`,
+      [caseId],
     );
-    undo.push(() => restoreApplicationStatuses(supabase, applications));
-
-    payments = await run(
-      supabase
-        .from("payment")
-        .update({
-          status: approve ? "approved" : "rejected",
-          updated_by: actor,
-          updation_timestamp: now(),
-        })
-        .in("payment_id", paymentIds)
-        .select("payment_id, amount, payment_reference, status"),
-    );
-    undo.push(() =>
-      supabase
-        .from("payment")
-        .update({ status: "pending" })
-        .in("payment_id", paymentIds),
-    );
-
-    reviewTasks = await run(
-      supabase
-        .from("task")
-        .update({
-          status: "completed",
-          decision,
-          comments,
-          updated_by: actor,
-          updation_timestamp: now(),
-        })
-        .eq("case_id", caseId)
-        .eq("task_type_id", depositReviewTaskTypeId)
-        .eq("status", "pending")
-        .is("discontinued_at", null)
-        .select("task_id, status, decision"),
-    );
-  } catch (error) {
-    for (const step of undo.reverse()) {
-      const { error: undoError } = await step();
-      if (undoError) console.error("Deposit review undo failed:", undoError);
+    if (pendingPayments.length === 0) {
+      throw depositError(
+        409,
+        "NO_PENDING_DEPOSIT",
+        "Case has no pending deposit to review",
+      );
     }
-    throw error;
-  }
+
+    const nextStatusId = await lookupId(
+      db,
+      CASE_STATUS_ID_SQL,
+      nextStatusCode,
+      "case_status",
+    );
+    const nextApplicationStatusId = await lookupId(
+      db,
+      APP_STATUS_ID_SQL,
+      nextApplicationStatusCode,
+      "app_status",
+    );
+    const depositReviewTaskTypeId = await lookupId(
+      db,
+      TASK_TYPE_ID_SQL,
+      "DepositReview",
+      "s_task",
+    );
+    const totalCents = pendingPayments.reduce(
+      (sum, p) => sum + toCents(p.amount),
+      0,
+    );
+
+    // ---- Writes ----
+    await db.query(
+      `update b_case set status_id = $1, initial_deposit_received = $2,
+       updated_by = $3, updation_timestamp = now() where case_id = $4`,
+      // A rejected deposit no longer counts as received.
+      [nextStatusId, approve ? fromCents(totalCents) : 0, actor, caseId],
+    );
+
+    await db.query(
+      `update b_applications set status_id = $1, updated_by = $2,
+       updation_timestamp = now() where case_id = $3 and discontinued_at is null`,
+      [nextApplicationStatusId, actor, caseId],
+    );
+
+    const { rows: payments } = await db.query(
+      `update payment set status = $1, updated_by = $2, updation_timestamp = now()
+       where payment_id = any($3)
+       returning payment_id, amount, payment_reference, status`,
+      [
+        approve ? "approved" : "rejected",
+        actor,
+        pendingPayments.map((p) => p.payment_id),
+      ],
+    );
+
+    const { rows: reviewTasks } = await db.query(
+      `update task set status = 'completed', decision = $1, comments = $2,
+       updated_by = $3, updation_timestamp = now()
+       where case_id = $4 and task_type_id = $5 and status = 'pending'
+         and discontinued_at is null
+       returning task_id, status, decision`,
+      [decision, comments, actor, caseId, depositReviewTaskTypeId],
+    );
+
+    let notification = null;
+    if (bCase.spoc_user_id == null) {
+      console.warn(`Deposit review: case ${caseId} has no SPOC user to notify`);
+    } else {
+      const leadName =
+        [bCase.lead_first_name, bCase.lead_surname].filter(Boolean).join(" ") ||
+        `case ${caseId}`;
+      const { rows } = await db.query(
+        `insert into notification (recipient_user_id, case_id, task_id,
+           notification_code, event_type, message, channel, created_by)
+         values ($1, $2, $3, $4, $5, $6, 'in_app', $7)
+         returning notification_id, recipient_user_id, event_type, message, channel`,
+        [
+          bCase.spoc_user_id,
+          caseId,
+          reviewTasks[0]?.task_id ?? null,
+          DEPOSIT_DECISION_NOTIFICATION_CODE,
+          approve ? "deposit_approved" : "deposit_rejected",
+          depositDecisionMessage(approve, leadName),
+          actor,
+        ],
+      );
+      notification = {
+        ...rows[0],
+        notification_id: Number(rows[0].notification_id),
+      };
+    }
+
+    return {
+      totalCents,
+      minimum: Number(bCase.minimum_deposit_amount),
+      payments: payments.map((p) => ({
+        ...p,
+        payment_id: Number(p.payment_id),
+        amount: Number(p.amount),
+      })),
+      reviewTasks: reviewTasks.map((t) => ({
+        ...t,
+        task_id: Number(t.task_id),
+      })),
+      notification,
+    };
+  });
 
   const caseCreated = approve
-    ? await startCaseCreated(caseId, totalCents, userId)
+    ? await startCaseCreated(caseId, reviewed.totalCents, userId)
     : { applications: [], info_form: null, info_form_error: null };
 
   return {
@@ -744,10 +777,11 @@ const reviewDepositService = async (caseId, body, userId) => {
     case_status: nextStatusCode,
     application_status: nextApplicationStatusCode,
     decision,
-    total_paid: approve ? fromCents(totalCents) : 0,
-    minimum_deposit_amount: Number(bCase.minimum_deposit_amount),
-    payments,
-    review_tasks: reviewTasks,
+    total_paid: approve ? fromCents(reviewed.totalCents) : 0,
+    minimum_deposit_amount: reviewed.minimum,
+    payments: reviewed.payments,
+    review_tasks: reviewed.reviewTasks,
+    notification: reviewed.notification,
     ...caseCreated,
   };
 };
@@ -764,6 +798,7 @@ module.exports = {
   splitEqually,
   validateSubmission,
   validateReview,
+  depositDecisionMessage,
   isValidTimeZone,
   toCents,
   fromCents,

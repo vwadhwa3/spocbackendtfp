@@ -21,6 +21,7 @@ const visaHistoryRoutes = require("./routes/visaHistory.routes");
 const travelInfoRoutes = require("./routes/travelInfo.routes");
 const documentTypeRoutes = require("./routes/documentType.routes");
 const documentCategoryRoutes = require("./routes/documentCategory.routes");
+const notificationRoutes = require("./routes/notification.routes");
 
 // Admin routes
 const appStatusRoutes = require("./routes/Admin/appStatus.routes");
@@ -163,6 +164,7 @@ app.use("/api", infoFormRoutes);
 app.use("/api", lookupRoutes);
 app.use("/api/customer", customerRoutes);
 app.use("/api/case", caseRoutes);
+app.use("/api/notifications", notificationRoutes);
 
 app.use("/visa-category", visaCategoryRoutes);
 app.use("/visa-history", visaHistoryRoutes);
