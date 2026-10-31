@@ -61,6 +61,7 @@ const writeTravelInfo = async (supabase, payload, actor) => {
  *   form_id                                        – required
  *   visa_type                                       – required, must match visa_category.code
  *   travel_dates[].travel_date                      – required, YYYY-MM-DD, strictly after today
+ *   travel_dates[].travel_end_date                  – optional, YYYY-MM-DD, not before travel_date
  *   travel_dates[].countries_to_visit                – required, non-empty array of country ids
  *   destination_preferences[].destination_country_id – required, valid country id
  *   destination_preferences[].application_city_id    – required, valid city id
@@ -127,6 +128,16 @@ const saveTravelInfoService = async (data) => {
         errors.push({
           field: `travel_dates[${i}].travel_date`,
           message: "Add at least one travel date",
+        });
+      }
+      if (
+        row?.travel_end_date &&
+        (!isValidDateString(row.travel_end_date) ||
+          row.travel_end_date < row.travel_date)
+      ) {
+        errors.push({
+          field: `travel_dates[${i}].travel_end_date`,
+          message: "Travel end date must be on or after the start date",
         });
       }
       if (
@@ -249,6 +260,7 @@ const saveTravelInfoService = async (data) => {
   // ---- Normalize ----
   const normalizedTravelDates = travel_dates.map((row) => ({
     travel_date: row.travel_date,
+    travel_end_date: t(row.travel_end_date),
     countries_to_visit: [
       ...new Set(row.countries_to_visit.map((id) => Number(id))),
     ],
@@ -369,6 +381,7 @@ const getTravelInfoService = async (form_id) => {
 
     return {
       travel_date: row.travel_date,
+      travel_end_date: row.travel_end_date ?? null,
       countries_to_visit: row.countries_to_visit || [],
       countries_to_visit_names: (row.countries_to_visit || [])
         .map((id) => countryById.get(id)?.name)

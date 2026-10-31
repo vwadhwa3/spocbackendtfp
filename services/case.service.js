@@ -1136,6 +1136,12 @@ const CUSTOMER_APPLICANTS_SQL = `
          ct.had_different_name,
          ct.previous_name,
          ct.date_of_birth::text as date_of_birth,
+         ct.gender_id,
+         ct.marital_status_id,
+         ct.nationality_id,
+         ct.place_of_birth_id,
+         coalesce(ct.country_of_birth_id, pob.country_id) as country_of_birth_id,
+         ct.travel_document_type as travel_document_type_code,
          ct.phone_number,
          ct.whatsapp_number,
          ct.email,
@@ -1155,6 +1161,7 @@ const CUSTOMER_APPLICANTS_SQL = `
                    'city', ai.city,
                    'county', ai.county,
                    'country', aic.name,
+                   'country_id', ai.country_id,
                    'mobile_number', ai.mobile_number,
                    'whatsapp_number', ai.whatsapp_number,
                    'email', ai.email)
@@ -1164,6 +1171,7 @@ const CUSTOMER_APPLICANTS_SQL = `
           order by ai.address_info_id desc limit 1) as address,
          (select json_build_object(
                    'permit_type', pt.label,
+                   'permit_type_id', rp.permit_type_id,
                    'permit_number', rp.permit_number,
                    'issue_date', rp.issue_date::text,
                    'expiry_date', rp.expiry_date::text,
@@ -1175,6 +1183,7 @@ const CUSTOMER_APPLICANTS_SQL = `
           order by rp.residence_permit_id desc limit 1) as residence_permit,
          (select json_build_object(
                    'occupation', coalesce(oc.label, oi.occupation_category),
+                   'occupation_category', oi.occupation_category,
                    'employer_name', oi.employer_name,
                    'job_title', oi.job_title,
                    'start_date', oi.start_date::text,
@@ -1192,21 +1201,25 @@ const CUSTOMER_APPLICANTS_SQL = `
                    'visa_sticker_number', vh.visa_sticker_number,
                    'visa_valid_from', vh.visa_valid_from::text,
                    'visa_valid_to', vh.visa_valid_to::text,
-                   'issuing_country', vhc.name)
+                   'issuing_country', vhc.name,
+                   'issuing_country_id', vh.issuing_country_id)
           from visa_history vh
           left join country vhc on vhc.country_id = vh.issuing_country_id
           where vh.form_id = f.form_id and vh.discontinued_at is null
           order by vh.visa_history_id desc limit 1) as visa_history,
          (select json_build_object(
                    'funding_source', coalesce(fs.label, fi.funding_source),
+                   'funding_source_code', fi.funding_source,
                    'sponsor_first_name', fi.sponsor_first_name,
                    'sponsor_surname', fi.sponsor_surname,
                    'sponsor_gender', fi.sponsor_gender,
                    'sponsor_address', fi.sponsor_address,
                    'sponsor_country', fic.name,
+                   'sponsor_country_id', fi.sponsor_country_id,
                    'sponsor_contact_number', fi.sponsor_contact_number,
                    'sponsor_email', fi.sponsor_email,
                    'sponsor_occupation', coalesce(foc.label, fi.sponsor_occupation_category),
+                   'sponsor_occupation_category', fi.sponsor_occupation_category,
                    'joins_eu_family_member', fi.joins_eu_family_member)
           from financing_info fi
           left join funding_source fs on fs.code = fi.funding_source
@@ -1251,7 +1264,8 @@ const CUSTOMER_DOCUMENTS_SQL = `
   select * from (
     select 'attachment-' || at.attachment_id as document_key,
            at.application_id,
-           coalesce(dt.name, at.file_name) as document_name,
+           coalesce(at.file_name, dt.name) as document_name,
+           at.document_type_id,
            dc.name as document_category,
            case when at.uploaded_by_customer = 1
                 then nullif(concat_ws(' ', uc.first_name, uc.surname), '')
@@ -1272,6 +1286,7 @@ const CUSTOMER_DOCUMENTS_SQL = `
            a.application_id,
            concat(coalesce(tdt.label, 'Travel document'), ' (',
                   concat_ws(' ', ct.first_name, ct.surname), ')'),
+           null,
            'Travel document',
            nullif(concat_ws(' ', u.first_name, u.last_name), ''),
            ct.creation_timestamp
@@ -1333,8 +1348,8 @@ const DOCUMENT_KEY_RE = /^(travel-document|attachment)-(\d+)$/;
 
 const isUrl = (value) => /^https?:\/\//i.test(value ?? "");
 
-// Where the file lives: a storage path for travel documents, a ready URL for
-// attachments that have one.
+// Where the file lives: a storage path, or a ready URL for attachments that
+// have one.
 const findDocumentFile = async (kind, id) =>
   withClient(async (db) => {
     if (kind === "travel-document") {
@@ -1346,7 +1361,7 @@ const findDocumentFile = async (kind, id) =>
       return rows[0]?.path ? rows[0] : null;
     }
     const { rows } = await db.query(
-      `select url_path as path from attachment
+      `select url_path as path, file_name from attachment
        where attachment_id = $1 and discontinued_at is null`,
       [id],
     );
@@ -1356,8 +1371,8 @@ const findDocumentFile = async (kind, id) =>
 // Get Document Link
 //
 // A short-lived link to view (or, with download, save) one document from the
-// customer page. Travel documents sit in a private storage bucket, so the
-// link is signed; the file is never proxied through this server.
+// customer page. Stored files sit in a private storage bucket, so the link is
+// signed; the file is never proxied through this server.
 const getDocumentLinkService = async (
   documentKey,
   { download = false } = {},
@@ -1369,7 +1384,7 @@ const getDocumentLinkService = async (
   const file = await findDocumentFile(kind, Number(id));
   if (!file) throw caseError(404, "DOCUMENT_NOT_FOUND", "Document not found");
   if (isUrl(file.path)) return { url: file.path, expires_in: null };
-  if (kind !== "travel-document" || !file.path) {
+  if (!file.path) {
     throw caseError(
       404,
       "DOCUMENT_FILE_UNAVAILABLE",
@@ -1380,7 +1395,10 @@ const getDocumentLinkService = async (
   // Saved as e.g. "Emma Carter travel document.pdf" instead of the random
   // storage name.
   const ext = file.path.split(".").pop();
-  const fileName = `${[file.first_name, file.surname].filter(Boolean).join(" ") || "Travel"} travel document.${ext}`;
+  const fileName =
+    kind === "travel-document"
+      ? `${[file.first_name, file.surname].filter(Boolean).join(" ") || "Travel"} travel document.${ext}`
+      : `${(file.file_name ?? "Document").replace(/\.[^.]+$/, "")}.${ext}`;
 
   const { data, error } = await getSupabase()
     .storage.from(getTravelDocumentsBucket())
@@ -2040,6 +2058,12 @@ module.exports = {
   decideDeposit,
   detectFileType,
   normalizePhoneInput,
+  isValidPhone,
+  caseError,
+  validationError,
+  insertRow,
+  getTravelDocumentsBucket,
+  DOCUMENT_KEY_RE,
   toQuoteLine,
   summarizeQuote,
   forApplicants,

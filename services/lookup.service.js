@@ -1,4 +1,5 @@
 const { getSupabase } = require("../config/database");
+const { withClient } = require("../utils/db.util");
 const { ROLES } = require("../middleware/role.middleware");
 const { getEnabledBankAccountsService } = require("./deposit.service");
 
@@ -143,6 +144,37 @@ const getTravelDocumentTypesService = async () =>
       .order("travel_doc_type_id"),
   );
 
+// Get Permit Types
+const getPermitTypesService = async () =>
+  run(
+    getSupabase()
+      .from("permit_type")
+      .select("permit_type_id, label")
+      .order("label"),
+  );
+
+// Get Occupation Categories
+const getOccupationCategoriesService = async () =>
+  run(getSupabase().from("occupation_category").select("code, label"));
+
+// Get Funding Sources
+const getFundingSourcesService = async () =>
+  run(getSupabase().from("funding_source").select("code, label"));
+
+// Get Document Types
+const getDocumentTypesService = async () =>
+  withClient(async (db) => {
+    const { rows } = await db.query(
+      `select dt.document_type_id, dt.name, dc.name as document_category
+       from document_type dt
+       left join document_category dc
+         on dc.document_category_id = dt.document_category_id
+       where dt.discontinued_at is null
+       order by dt.name`,
+    );
+    return rows;
+  });
+
 module.exports = {
   getCountriesService,
   getCitiesService,
@@ -154,6 +186,10 @@ module.exports = {
   getGendersService,
   getMaritalStatusesService,
   getTravelDocumentTypesService,
+  getPermitTypesService,
+  getOccupationCategoriesService,
+  getFundingSourcesService,
+  getDocumentTypesService,
   parseAssignableRole,
   parseCountryId,
 };

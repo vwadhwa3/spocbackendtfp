@@ -15,6 +15,10 @@ const {
   getGendersController,
   getMaritalStatusesController,
   getTravelDocumentTypesController,
+  getPermitTypesController,
+  getOccupationCategoriesController,
+  getFundingSourcesController,
+  getDocumentTypesController,
 } = require("../controllers/lookup.controller");
 
 // Add New Case wizard dropdowns. The data isn't role-sensitive, but the routes
@@ -56,5 +60,15 @@ router.get(
   spocOnly,
   getTravelDocumentTypesController,
 );
+
+// Customer page edit form dropdowns.
+router.get("/permit-types", spocOnly, getPermitTypesController);
+router.get(
+  "/occupation-categories",
+  spocOnly,
+  getOccupationCategoriesController,
+);
+router.get("/funding-sources", spocOnly, getFundingSourcesController);
+router.get("/document-types", spocOnly, getDocumentTypesController);
 
 module.exports = router;

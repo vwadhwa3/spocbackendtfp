@@ -9,6 +9,10 @@ const {
   getGendersService,
   getMaritalStatusesService,
   getTravelDocumentTypesService,
+  getPermitTypesService,
+  getOccupationCategoriesService,
+  getFundingSourcesService,
+  getDocumentTypesService,
   parseAssignableRole,
   parseCountryId,
 } = require("../services/lookup.service");
@@ -75,7 +79,25 @@ const getTravelDocumentTypesController = handle(() =>
   getTravelDocumentTypesService(),
 );
 
+// Get Permit Types
+const getPermitTypesController = handle(() => getPermitTypesService());
+
+// Get Occupation Categories
+const getOccupationCategoriesController = handle(() =>
+  getOccupationCategoriesService(),
+);
+
+// Get Funding Sources
+const getFundingSourcesController = handle(() => getFundingSourcesService());
+
+// Get Document Types
+const getDocumentTypesController = handle(() => getDocumentTypesService());
+
 module.exports = {
+  getPermitTypesController,
+  getOccupationCategoriesController,
+  getFundingSourcesController,
+  getDocumentTypesController,
   getCountriesController,
   getCitiesController,
   getVisaCategoriesController,

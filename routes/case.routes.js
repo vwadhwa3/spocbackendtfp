@@ -14,6 +14,14 @@ const {
   getMinimumDepositController,
   createFullCaseController,
 } = require("../controllers/case.controller");
+const {
+  updateApplicantSectionController,
+  updateTravelInfoController,
+  updatePreviousVisaController,
+  uploadDocumentController,
+  updateDocumentController,
+  deleteDocumentController,
+} = require("../controllers/applicantEdit.controller");
 const { MAX_APPLICANTS, MAX_FILE_BYTES } = require("../services/case.service");
 
 // Add New Case is SPOC-only, enforced here and not just hidden in the UI.
@@ -46,6 +54,27 @@ const parseUpload = (req, res, next) =>
     });
   });
 
+// One optional file in the `file` field of a document upload or replace.
+const documentUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_FILE_BYTES, files: 1 },
+}).single("file");
+
+const parseDocumentUpload = (req, res, next) =>
+  documentUpload(req, res, (error) => {
+    if (!error) return next();
+    if (!(error instanceof multer.MulterError)) return next(error);
+
+    res.status(400).json({
+      success: false,
+      error: "VALIDATION_ERROR",
+      message:
+        error.code === "LIMIT_FILE_SIZE"
+          ? "Document must be at most 10MB"
+          : error.message,
+    });
+  });
+
 // List Cases
 router.get("/list", spocOnly, listCasesController);
 
@@ -66,5 +95,55 @@ router.get("/minimum-deposit", spocOnly, getMinimumDepositController);
 
 // Create Full Case
 router.post("/create-full", spocOnly, parseUpload, createFullCaseController);
+
+// Edit One Section Of An Applicant (customer page)
+for (const section of [
+  "personal",
+  "travel-document",
+  "address",
+  "residence-permit",
+  "occupation",
+  "financing",
+  "additional",
+]) {
+  router.patch(
+    `/application/:applicationId/${section}`,
+    spocOnly,
+    updateApplicantSectionController(section),
+  );
+}
+
+// Edit Travel Information
+router.patch(
+  "/application/:applicationId/travel-info",
+  spocOnly,
+  updateTravelInfoController,
+);
+
+// Edit Previous Visa
+router.patch(
+  "/application/:applicationId/previous-visa",
+  spocOnly,
+  updatePreviousVisaController,
+);
+
+// Upload Document
+router.post(
+  "/application/:applicationId/document",
+  spocOnly,
+  parseDocumentUpload,
+  uploadDocumentController,
+);
+
+// Rename, Retype Or Replace Document
+router.patch(
+  "/document/:documentKey",
+  spocOnly,
+  parseDocumentUpload,
+  updateDocumentController,
+);
+
+// Delete Document
+router.delete("/document/:documentKey", spocOnly, deleteDocumentController);
 
 module.exports = router;
