@@ -70,7 +70,8 @@ const loginService = async ({ email, password }) => {
 const decodeTokenService = (token) => {
   try {
     return jwt.verify(token, JWT_SECRET);
-  } catch {
+  } catch (err) {
+    console.error("decodeTokenService error:", err.name, err.message);
     return null;
   }
 };

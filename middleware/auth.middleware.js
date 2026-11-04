@@ -45,9 +45,8 @@ const authenticate = async (req, res, next) => {
         message: "Invalid or expired token",
       });
     }
-
+    
     const user = await getActiveUserService(decoded.userId);
-
     if (!user) {
       return res.status(401).json({
         success: false,
