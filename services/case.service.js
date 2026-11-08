@@ -42,11 +42,6 @@ const CONTACT_ROLE_ID = 1;
 // required; the customer's info form corrects it later.
 const DEFAULT_MARITAL_STATUS_ID = 1;
 
-// Until service_pack_pricing / add_on_pack_pricing are filled in, a pack with
-// no pricing row costs its price_gbp and needs this share of it upfront.
-const FALLBACK_DEPOSIT_RATE = 0.5;
-const FALLBACK_CURRENCY_CODE = "GBP";
-
 // Multipart file field for applicants[i]'s travel document.
 const travelDocumentField = (i) => `travel_document_${i}`;
 
@@ -368,7 +363,7 @@ const PRICING_FILTER = `
   and (application_country_id is null or application_country_id = $3)`;
 
 const SERVICE_PACK_PRICING_SQL = `
-  select sp.service_pack_id as pack_id, sp.name, sp.price_gbp,
+  select sp.service_pack_id as pack_id, sp.name,
          p.price, p.upfront_price, p.currency_id
   from service_pack sp
   left join lateral (
@@ -385,7 +380,7 @@ const SERVICE_PACK_PRICING_SQL = `
     and sp.discontinued_at is null`;
 
 const ADD_ON_PACK_PRICING_SQL = `
-  select ap.add_on_pack_id as pack_id, ap.name, ap.price_gbp,
+  select ap.add_on_pack_id as pack_id, ap.name,
          p.price, p.upfront_price, p.currency_id
   from add_on_pack ap
   left join lateral (
@@ -404,28 +399,58 @@ const ADD_ON_PACK_PRICING_SQL = `
     and ap.active = 1
     and ap.discontinued_at is null`;
 
-// One quote line per booked pack, in integer cents.
-const toQuoteLine = (row, packType, fallbackCurrencyId) => {
-  const base = { pack_type: packType, pack_id: row.pack_id, name: row.name };
+// Booked service packs that service_pack_country_restriction blocks for this
+// destination. A null application country means the rule applies to all.
+const RESTRICTED_SERVICE_PACKS_SQL = `
+  select distinct sp.name
+  from service_pack_country_restriction r
+  join service_pack sp on sp.service_pack_id = r.service_pack_id
+  where r.service_pack_id = any($1::int[])
+    and r.destination_country_id = $2
+    and (r.application_country_id is null or r.application_country_id = $3)
+    and r.is_active = 1
+    and r.discontinued_at is null
+  order by sp.name`;
 
-  if (row.currency_id != null) {
-    return {
-      ...base,
-      currency_id: row.currency_id,
-      priceCents: toCents(row.price),
-      upfrontCents: toCents(row.upfront_price),
-      pricing_source: "pricing",
-    };
+// One quote line per booked pack, in integer cents.
+const toQuoteLine = (row, packType) => ({
+  pack_type: packType,
+  pack_id: row.pack_id,
+  name: row.name,
+  currency_id: row.currency_id,
+  priceCents: toCents(row.price),
+  upfrontCents: toCents(row.upfront_price),
+});
+
+// A pack with no pricing row for this country can't be booked: guessing a
+// price would ask the customer for the wrong deposit.
+const checkPricesSet = (rows) => {
+  const unpricedNames = [];
+  for (const row of rows) {
+    if (row.currency_id == null) unpricedNames.push(row.name);
   }
 
-  const priceCents = toCents(row.price_gbp);
-  return {
-    ...base,
-    currency_id: fallbackCurrencyId,
-    priceCents,
-    upfrontCents: Math.round(priceCents * FALLBACK_DEPOSIT_RATE),
-    pricing_source: "fallback",
-  };
+  if (unpricedNames.length > 0) {
+    throw caseError(
+      422,
+      "PRICE_NOT_SET",
+      `Price not set for: ${unpricedNames.join(", ")}`,
+    );
+  }
+};
+
+// rows are the restricted packs found by RESTRICTED_SERVICE_PACKS_SQL.
+const checkPacksAvailable = (rows) => {
+  if (rows.length === 0) return;
+
+  const names = [];
+  for (const row of rows) names.push(row.name);
+
+  throw caseError(
+    422,
+    "PACK_NOT_AVAILABLE",
+    `Not available for this destination: ${names.join(", ")}`,
+  );
 };
 
 // Payments are compared with the minimum, so every pack must be priced in one
@@ -503,20 +528,17 @@ const quoteDeposit = async (
   reportMissing("lead.add_on_pack_ids", addOnPackIds, addOnRows);
   if (errors.length > 0) throw validationError(errors);
 
-  let fallbackCurrencyId = null;
-  if ([...serviceRows, ...addOnRows].some((r) => r.currency_id == null)) {
-    const { rows } = await db.query(
-      "select currency_id from currency where iso_code = $1 and discontinued_at is null",
-      [FALLBACK_CURRENCY_CODE],
-    );
-    if (!rows[0])
-      throw new Error(`currency '${FALLBACK_CURRENCY_CODE}' is not configured`);
-    fallbackCurrencyId = rows[0].currency_id;
-  }
+  const { rows: restrictedRows } = await db.query(
+    RESTRICTED_SERVICE_PACKS_SQL,
+    [servicePackIds, ...params],
+  );
+  checkPacksAvailable(restrictedRows);
+
+  checkPricesSet([...serviceRows, ...addOnRows]);
 
   return summarizeQuote([
-    ...serviceRows.map((r) => toQuoteLine(r, "service", fallbackCurrencyId)),
-    ...addOnRows.map((r) => toQuoteLine(r, "addon", fallbackCurrencyId)),
+    ...serviceRows.map((r) => toQuoteLine(r, "service")),
+    ...addOnRows.map((r) => toQuoteLine(r, "addon")),
   ]);
 };
 
@@ -556,7 +578,6 @@ const formatQuote = (quote, currencyCode) => ({
     name: l.name,
     price: fromCents(l.priceCents),
     upfront_amount: fromCents(l.upfrontCents),
-    pricing_source: l.pricing_source,
   })),
 });
 
@@ -2065,6 +2086,8 @@ module.exports = {
   getTravelDocumentsBucket,
   DOCUMENT_KEY_RE,
   toQuoteLine,
+  checkPricesSet,
+  checkPacksAvailable,
   summarizeQuote,
   forApplicants,
   applicationPackRows,

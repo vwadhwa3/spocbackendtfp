@@ -6,6 +6,8 @@ const {
   detectFileType,
   normalizePhoneInput,
   toQuoteLine,
+  checkPricesSet,
+  checkPacksAvailable,
   summarizeQuote,
   forApplicants,
   applicationPackRows,
@@ -201,45 +203,40 @@ test("deposit at or above the minimum opens the case, below goes to review", () 
   });
 });
 
-test("pack without a pricing row falls back to half its GBP price", () => {
-  const line = toQuoteLine(
-    {
-      pack_id: 1,
-      name: "Premium Plan",
-      price_gbp: "149.51",
-      currency_id: null,
-    },
-    "service",
-    1,
-  );
-  assert.deepStrictEqual(line, {
-    pack_type: "service",
-    pack_id: 1,
-    name: "Premium Plan",
-    currency_id: 1,
-    priceCents: 14951,
-    upfrontCents: 7476,
-    pricing_source: "fallback",
-  });
-});
-
-test("pricing row wins over the fallback", () => {
+test("quote line uses the pricing row's price, upfront and currency", () => {
   const line = toQuoteLine(
     {
       pack_id: 4,
       name: "Fast Track",
-      price_gbp: "25.00",
       price: "30.00",
       upfront_price: "10.00",
       currency_id: 3,
     },
     "addon",
-    1,
   );
-  assert.strictEqual(line.currency_id, 3);
-  assert.strictEqual(line.priceCents, 3000);
-  assert.strictEqual(line.upfrontCents, 1000);
-  assert.strictEqual(line.pricing_source, "pricing");
+  assert.deepStrictEqual(line, {
+    pack_type: "addon",
+    pack_id: 4,
+    name: "Fast Track",
+    currency_id: 3,
+    priceCents: 3000,
+    upfrontCents: 1000,
+  });
+});
+
+test("pack with no pricing row is an error, naming every unpriced pack", () => {
+  const priced = { name: "Classic", currency_id: 1 };
+  const unpriced1 = { name: "Standard", currency_id: null };
+  const unpriced2 = { name: "Priority Upgrade", currency_id: null };
+
+  assert.doesNotThrow(() => checkPricesSet([priced]));
+  assert.throws(
+    () => checkPricesSet([priced, unpriced1, unpriced2]),
+    (error) =>
+      error.statusCode === 422 &&
+      error.error === "PRICE_NOT_SET" &&
+      error.message === "Price not set for: Standard, Priority Upgrade",
+  );
 });
 
 test("minimum is the sum of upfront amounts, in one currency only", () => {
@@ -485,4 +482,87 @@ test("my case: packs split into service packs and add-ons", () => {
     },
   );
   assert.deepStrictEqual(groupPacks([]), { service_packs: [], add_ons: [] });
+});
+
+/* ---- Minimum deposit acceptance: hand-calculated cases ---- */
+
+// Pricing rows from Saksham's sheets (docs/minimum-deposit.md), as the
+// database returns them. Currency 1 = GBP (UK), 2 = EUR (Ireland).
+const GBP = 1;
+const EUR = 2;
+const ukClassic = {
+  pack_id: 1,
+  name: "Classic",
+  price: "275.00",
+  upfront_price: "90.00",
+  currency_id: GBP,
+};
+const ukComfort = {
+  pack_id: 2,
+  name: "Comfort",
+  price: "125.00",
+  upfront_price: "40.00",
+  currency_id: GBP,
+};
+const ukRefundable = {
+  pack_id: 1,
+  name: "Refundable Upfront",
+  price: "25.00",
+  upfront_price: "10.00",
+  currency_id: GBP,
+};
+const ieClassic = {
+  pack_id: 1,
+  name: "Classic",
+  price: "300.00",
+  upfront_price: "90.00",
+  currency_id: EUR,
+};
+
+const quoteFor = (serviceRows, addOnRows, applicantCount) => {
+  const lines = [];
+  for (const row of serviceRows) lines.push(toQuoteLine(row, "service"));
+  for (const row of addOnRows) lines.push(toQuoteLine(row, "addon"));
+  return forApplicants(summarizeQuote(lines), applicantCount);
+};
+
+test("minimum deposit: UK Classic, one applicant", () => {
+  // 90 upfront x 1 applicant = 90
+  const quote = quoteFor([ukClassic], [], 1);
+  assert.strictEqual(quote.currency_id, GBP);
+  assert.strictEqual(quote.minimumCents, 9000);
+  assert.strictEqual(quote.totalCents, 27500);
+});
+
+test("minimum deposit: UK Comfort + Refundable Upfront, one applicant", () => {
+  // (40 + 10) x 1 applicant = 50
+  const quote = quoteFor([ukComfort], [ukRefundable], 1);
+  assert.strictEqual(quote.minimumCents, 5000);
+  assert.strictEqual(quote.totalCents, 15000);
+});
+
+test("minimum deposit: UK Comfort + Refundable Upfront, two applicants", () => {
+  // (40 + 10) x 2 applicants = 100
+  const quote = quoteFor([ukComfort], [ukRefundable], 2);
+  assert.strictEqual(quote.minimumCents, 10000);
+  assert.strictEqual(quote.totalCents, 30000);
+});
+
+test("minimum deposit: Ireland Classic is in euros", () => {
+  // 90 upfront x 1 applicant = 90 EUR
+  const quote = quoteFor([ieClassic], [], 1);
+  assert.strictEqual(quote.currency_id, EUR);
+  assert.strictEqual(quote.minimumCents, 9000);
+  assert.strictEqual(quote.totalCents, 30000);
+});
+
+test("restricted service pack is an error, naming every blocked pack", () => {
+  assert.doesNotThrow(() => checkPacksAvailable([]));
+  assert.throws(
+    () => checkPacksAvailable([{ name: "Standard" }]),
+    (error) =>
+      error.statusCode === 422 &&
+      error.error === "PACK_NOT_AVAILABLE" &&
+      error.message === "Not available for this destination: Standard",
+  );
 });
