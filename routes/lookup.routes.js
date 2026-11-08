@@ -10,6 +10,7 @@ const {
   getVisaCategoriesController,
   getServicePacksController,
   getAddOnPacksController,
+  getServicePackRestrictionsController,
   getBankAccountsController,
   getUsersByRoleController,
   getGendersController,
@@ -41,6 +42,13 @@ router.get("/service-packs", spocOnly, getServicePacksController);
 
 // Get Add-On Packs
 router.get("/add-on-packs", spocOnly, getAddOnPacksController);
+
+// Get Service Pack Restrictions
+router.get(
+  "/service-pack-restrictions",
+  spocOnly,
+  getServicePackRestrictionsController,
+);
 
 // Get Bank Accounts
 router.get("/bank-accounts", spocOnly, getBankAccountsController);

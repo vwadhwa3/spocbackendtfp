@@ -78,21 +78,23 @@ Follow-up with Saksham (2026-11-08):
 
 ## Pack availability
 
-Table `service_pack_country_restriction` (script: `docs/pack-restriction.sql`, run 2026-11-08,
-). One row blocks a service pack for a destination country, optionally
+Table `service_pack_country_restriction` (script: `docs/pack-restriction.sql`, run 2026-11-08).
+One row blocks a service pack for a destination country, optionally
 only for one application country. No row means the pack is available. Step 2
 and final submit return 422 `PACK_NOT_AVAILABLE` for a blocked pack.
 
 Run the script before deploying the code; without the table every step 2
 request fails.
 
+The Add New Case form hides blocked packs too: it loads the rules from
+`GET /api/service-pack-restrictions` and filters the service pack dropdown by
+the chosen destination and application city.
+
 ## Still open
 
 1. Switzerland and Belgium are not in the `country` table, so their Standard
    restriction rows can't be added yet.
-2. The pack dropdown (lookup endpoint) still lists blocked packs; the error
-   only appears at step 2.
-3. While the application city rule (below) stays, a UK case can't have
+2. While the application city rule (below) stays, a UK case can't have
    Germany as its destination, so the UK restriction can't trigger yet.
 
 ## Separate issue: application city rule

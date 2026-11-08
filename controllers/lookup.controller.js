@@ -4,6 +4,7 @@ const {
   getVisaCategoriesService,
   getServicePacksService,
   getAddOnPacksService,
+  getServicePackRestrictionsService,
   getBankAccountsService,
   getUsersByRoleService,
   getGendersService,
@@ -60,6 +61,11 @@ const getServicePacksController = handle(() => getServicePacksService());
 // Get Add-On Packs
 const getAddOnPacksController = handle(() => getAddOnPacksService());
 
+// Get Service Pack Restrictions
+const getServicePackRestrictionsController = handle(() =>
+  getServicePackRestrictionsService(),
+);
+
 // Get Bank Accounts
 const getBankAccountsController = handle(() => getBankAccountsService());
 
@@ -103,6 +109,7 @@ module.exports = {
   getVisaCategoriesController,
   getServicePacksController,
   getAddOnPacksController,
+  getServicePackRestrictionsController,
   getBankAccountsController,
   getUsersByRoleController,
   getGendersController,

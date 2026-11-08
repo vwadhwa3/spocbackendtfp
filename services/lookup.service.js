@@ -104,6 +104,18 @@ const getServicePacksService = () =>
 const getAddOnPacksService = () =>
   getActivePacks("add_on_pack", "add_on_pack_id");
 
+// Get Service Pack Restrictions
+// Each row blocks a service pack for a destination country. A null
+// application_country_id means the rule applies to every application country.
+const getServicePackRestrictionsService = () =>
+  run(
+    getSupabase()
+      .from("service_pack_country_restriction")
+      .select("service_pack_id, application_country_id, destination_country_id")
+      .eq("is_active", 1)
+      .is("discontinued_at", null),
+  );
+
 // Get Bank Accounts
 const getBankAccountsService = () => getEnabledBankAccountsService();
 
@@ -181,6 +193,7 @@ module.exports = {
   getVisaCategoriesService,
   getServicePacksService,
   getAddOnPacksService,
+  getServicePackRestrictionsService,
   getBankAccountsService,
   getUsersByRoleService,
   getGendersService,
